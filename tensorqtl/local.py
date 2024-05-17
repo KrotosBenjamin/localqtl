@@ -1,9 +1,9 @@
 ## This script process local ancestry data generated from
 ## RFMix v2.
 
+import re
 import pandas as pd
 from pathlib import Path
-
 
 import sys
 import tempfile
@@ -19,8 +19,41 @@ from pandas_plink import read_plink
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
 
-rfmix_prefix_path = "/dcs04/lieber/statsgen/shizhong/AANRI/local_ancestry/chr"
+rfmix_prefix_path = "/dcs04/lieber/statsgen/shizhong/AANRI/local_ancestry/"
 
+def extract_comments(file_path, comment_char='#'):
+    comments = []
+    with open(file_path, 'r') as file:
+        for line in file:
+            stripped_line = line.strip()
+            if stripped_line.startswith(comment_char):
+                comments.append(line.strip())
+    return comments
+
+
+def extract_sample_name(col_name, pop_label):
+    pattern = rf'(.*?):::hap\d+:::{pop_label}'
+    # Function to extract sample names
+    m = re.match(pattern, col_name)
+    if m:
+        return m.group(1)
+    return None
+
+
+def combine_haplotypes(df, pop_label):
+    # Extract unique sample names
+    sample_names = set(extract_sample_name(col, pop_label) for col in df.columns if extract_sample_name(col, pop_label) is not None)    
+    # Add new columns to match sample names
+    dfs = []
+    for sample in sample_names:
+        hap1_col = f'{sample}:::hap1:::{pop_label}'
+        hap2_col = f'{sample}:::hap2:::{pop_label}'
+        if hap1_col in df.columns and hap2_col in df.columns:
+            dfx = pd.DataFrame({f'{sample}': df[hap1_col] + df[hap2_col]})
+            dfs.append(dfx)
+    return pd.concat(dfs, axis=1)
+
+            
 class RFMixReader(object):
     def __init__(self, rfmix_prefix_path, select_samples=None,
                  exclude_chrs=None, dtype=np.int8):
@@ -39,37 +72,38 @@ class RFMixReader(object):
                   -o {rfmix_prefix_path}.chr$i \
                   --chromosome=chr$i
         """
-        # This all files with *fb.tsv
-        # For each file
-        ## Save chromosome and pos
-        ## Extract reference population
+        # List all files with *fb.tsv
+        data_dir = Path(rfmix_prefix_path)
+        for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
+            # Extract populations
+            pops = extract_comments(fb_file)[0].split()[1:]
+            # Load data
+            dat = pd.read_csv(fb_file, sep="\t", index_col=False,
+                              encoding='utf-8', comment="#",
+                              engines="pyarrow")
+            # Extract chromosome and pos
+            pos = dat.iloc[:, :4]
+            # Mean haplotype per population
+            pop_dict = {}
+            for pop_label in pops:
+                hap = combine_haplotypes(dat, pop_label)
+                pop_dict[pop_label] = hap
+
         ## Count alleles per pop
         #### TODO if 2 pops use only population
-        ## Select samples
-        ## Select chromosomes
         self.bim, self.fam, self.bed = read_plink(plink_prefix_path, verbose=verbose)
         self.bed = 2 - self.bed  # flip allele order: PLINK uses REF as effect allele
         if dtype == np.int8:
             self.bed[np.isnan(self.bed)] = -9  # convert missing (NaN) to -9 for int8
         self.bed = self.bed.astype(dtype, copy=False)
+        ## Select samples
         self.sample_ids = self.fam['iid'].tolist()
         if select_samples is not None:
             ix = [self.sample_ids.index(i) for i in select_samples]
             self.fam = self.fam.loc[ix]
             self.bed = self.bed[:,ix]
             self.sample_ids = self.fam['iid'].tolist()
-        if include_variants is not None:
-            m = self.bim['snp'].isin(include_variants).values
-            self.bed = self.bed[m,:]
-            self.bim = self.bim[m]
-            self.bim.reset_index(drop=True, inplace=True)
-            self.bim['i'] = self.bim.index
-        if exclude_variants is not None:
-            m = ~self.bim['snp'].isin(exclude_variants).values
-            self.bed = self.bed[m,:]
-            self.bim = self.bim[m]
-            self.bim.reset_index(drop=True, inplace=True)
-            self.bim['i'] = self.bim.index
+        ## Select chromosomes
         if exclude_chrs is not None:
             m = ~self.bim['chrom'].isin(exclude_chrs).values
             self.bed = self.bed[m,:]
