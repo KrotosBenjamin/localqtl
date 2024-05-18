@@ -3,6 +3,7 @@
 
 import re
 import pandas as pd
+import polars as pl
 from pathlib import Path
 
 import sys
@@ -49,11 +50,32 @@ def combine_haplotypes(df, pop_label):
         hap1_col = f'{sample}:::hap1:::{pop_label}'
         hap2_col = f'{sample}:::hap2:::{pop_label}'
         if hap1_col in df.columns and hap2_col in df.columns:
-            dfx = pd.DataFrame({f'{sample}': df[hap1_col] + df[hap2_col]})
+            dfx = dat.with_columns((pl.col(hap1_col)+pl.col(hap2_col))\
+                                   .alias(sample))\
+                     .select([sample])
             dfs.append(dfx)
-    return pd.concat(dfs, axis=1)
+    return pl.concat(dfs, how="align")
 
-            
+data_dir = Path(rfmix_prefix_path)
+main_pop_dict = {}; rf_pos = pl.LazyFrame();
+for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
+    print(i)
+    # Load data
+    dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
+    # Extract chromosome and pos
+    pos = dat.select(dat.columns[:4])
+    rf_pos = pl.concat([rf_pos, pos])
+    # Extract populations
+    pops = extract_comments(fb_file)[0].split()[1:]
+    # Mean haplotype per population
+    for pop_label in pops:
+        hap = combine_haplotypes(dat, pop_label)
+        if pop_label not in main_pop_dict:
+            main_pop_dict[pop_label] = hap
+        else:
+            main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
+
+
 class RFMixReader(object):
     def __init__(self, rfmix_prefix_path, select_samples=None,
                  exclude_chrs=None, dtype=np.int8):
@@ -74,20 +96,22 @@ class RFMixReader(object):
         """
         # List all files with *fb.tsv
         data_dir = Path(rfmix_prefix_path)
+        main_pop_dict = {}; rf_pos = pl.LazyFrame();
         for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
+            # Load data
+            dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
+            # Extract chromosome and pos
+            pos = dat.select(dat.columns[:4])
+            rf_pos = pl.concat([rf_pos, pos])
             # Extract populations
             pops = extract_comments(fb_file)[0].split()[1:]
-            # Load data
-            dat = pd.read_csv(fb_file, sep="\t", index_col=False,
-                              encoding='utf-8', comment="#",
-                              engines="pyarrow")
-            # Extract chromosome and pos
-            pos = dat.iloc[:, :4]
             # Mean haplotype per population
-            pop_dict = {}
             for pop_label in pops:
                 hap = combine_haplotypes(dat, pop_label)
-                pop_dict[pop_label] = hap
+                if pop_label not in main_pop_dict:
+                    main_pop_dict[pop_label] = hap
+                else:
+                    main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
 
         ## Count alleles per pop
         #### TODO if 2 pops use only population
