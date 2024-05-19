@@ -2,7 +2,7 @@
 ## RFMix v2.
 
 import re
-import pandas as pd
+import cudf as pd
 import polars as pl
 from pathlib import Path
 
@@ -25,7 +25,9 @@ rfmix_prefix_path = "/dcs04/lieber/statsgen/shizhong/AANRI/local_ancestry/"
 def extract_comments(file_path, comment_char='#'):
     comments = []
     with open(file_path, 'r') as file:
-        for line in file:
+        for i, line in enumerate(file):
+            if i >= 5:
+                break
             stripped_line = line.strip()
             if stripped_line.startswith(comment_char):
                 comments.append(line.strip())
@@ -41,39 +43,45 @@ def extract_sample_name(col_name, pop_label):
     return None
 
 
-def combine_haplotypes(df, pop_label):
+def combine_haplotypes(df, pop_label, sample_ids):
     # Extract unique sample names
-    sample_names = set(extract_sample_name(col, pop_label) for col in df.columns if extract_sample_name(col, pop_label) is not None)    
+    if sample_ids is None:
+        sample_names = set(extract_sample_name(col, pop_label) for col in df.columns if extract_sample_name(col, pop_label) is not None)
+    else:
+        sample_names = sample_ids
     # Add new columns to match sample names
     dfs = []
     for sample in sample_names:
         hap1_col = f'{sample}:::hap1:::{pop_label}'
         hap2_col = f'{sample}:::hap2:::{pop_label}'
         if hap1_col in df.columns and hap2_col in df.columns:
-            dfx = dat.with_columns((pl.col(hap1_col)+pl.col(hap2_col))\
-                                   .alias(sample))\
-                     .select([sample])
+            dfx = df.select([hap1_col, hap2_col])\
+                    .with_columns((pl.col(hap1_col)+pl.col(hap2_col))\
+                                  .alias(sample))\
+                    .select([sample])
             dfs.append(dfx)
     return pl.concat(dfs, how="align")
 
-data_dir = Path(rfmix_prefix_path)
-main_pop_dict = {}; rf_pos = pl.LazyFrame();
-for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
-    print(i)
-    # Load data
-    dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
-    # Extract chromosome and pos
-    pos = dat.select(dat.columns[:4])
-    rf_pos = pl.concat([rf_pos, pos])
-    # Extract populations
-    pops = extract_comments(fb_file)[0].split()[1:]
-    # Mean haplotype per population
-    for pop_label in pops:
-        hap = combine_haplotypes(dat, pop_label)
-        if pop_label not in main_pop_dict:
-            main_pop_dict[pop_label] = hap
-        else:
-            main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
+
+def get_rf_results(rfmix_prefix_path, sample_ids=None):
+    main_pop_dict = {}; dfs = []
+    data_dir = Path(rfmix_prefix_path)
+    for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
+        ##print(i) ## should monitor progress here
+        # Load data
+        dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
+        # Extract chromosome and pos
+        dfs.append(dat.select(dat.columns[:4]))
+        # Extract populations
+        pops = extract_comments(fb_file)[0].split()[1:]
+        # Mean haplotype per population
+        for pop_label in pops:
+            hap = combine_haplotypes(dat, pop_label, sample_ids)
+            if pop_label not in main_pop_dict:
+                main_pop_dict[pop_label] = hap
+            else:
+                main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
+    return pl.concat(dfs), main_pop_dict
 
 
 class RFMixReader(object):
@@ -95,24 +103,8 @@ class RFMixReader(object):
                   --chromosome=chr$i
         """
         # List all files with *fb.tsv
-        data_dir = Path(rfmix_prefix_path)
-        main_pop_dict = {}; rf_pos = pl.LazyFrame();
-        for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
-            # Load data
-            dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
-            # Extract chromosome and pos
-            pos = dat.select(dat.columns[:4])
-            rf_pos = pl.concat([rf_pos, pos])
-            # Extract populations
-            pops = extract_comments(fb_file)[0].split()[1:]
-            # Mean haplotype per population
-            for pop_label in pops:
-                hap = combine_haplotypes(dat, pop_label)
-                if pop_label not in main_pop_dict:
-                    main_pop_dict[pop_label] = hap
-                else:
-                    main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
-
+        rf_pos, pop_dict = get_rf_results(rfmix_prefix_path)
+        
         ## Count alleles per pop
         #### TODO if 2 pops use only population
         self.bim, self.fam, self.bed = read_plink(plink_prefix_path, verbose=verbose)
