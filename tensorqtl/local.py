@@ -3,12 +3,12 @@
 
 import re
 import cudf as pd
+import numpy as np
 import polars as pl
 from pathlib import Path
 
 import sys
 import tempfile
-import numpy as np
 import subprocess
 import os
 import gzip
@@ -20,69 +20,15 @@ from pandas_plink import read_plink
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
 
-rfmix_prefix_path = "/dcs04/lieber/statsgen/shizhong/AANRI/local_ancestry/"
+####################### Developmental stuff #####################
+def get_test_ids():
+    test_ids = "../example/sample_id_to_brnum.tsv"
+    return pd.read_csv(test_ids, sep="\t", usecols=[1])
 
-def extract_comments(file_path, comment_char='#'):
-    comments = []
-    with open(file_path, 'r') as file:
-        for i, line in enumerate(file):
-            if i >= 5:
-                break
-            stripped_line = line.strip()
-            if stripped_line.startswith(comment_char):
-                comments.append(line.strip())
-    return comments
-
-
-def extract_sample_name(col_name, pop_label):
-    pattern = rf'(.*?):::hap\d+:::{pop_label}'
-    # Function to extract sample names
-    m = re.match(pattern, col_name)
-    if m:
-        return m.group(1)
-    return None
-
-
-def combine_haplotypes(df, pop_label, sample_ids):
-    # Extract unique sample names
-    if sample_ids is None:
-        sample_names = set(extract_sample_name(col, pop_label) for col in df.columns if extract_sample_name(col, pop_label) is not None)
-    else:
-        sample_names = sample_ids
-    # Add new columns to match sample names
-    dfs = []
-    for sample in sample_names:
-        hap1_col = f'{sample}:::hap1:::{pop_label}'
-        hap2_col = f'{sample}:::hap2:::{pop_label}'
-        if hap1_col in df.columns and hap2_col in df.columns:
-            dfx = df.select([hap1_col, hap2_col])\
-                    .with_columns((pl.col(hap1_col)+pl.col(hap2_col))\
-                                  .alias(sample))\
-                    .select([sample])
-            dfs.append(dfx)
-    return pl.concat(dfs, how="align")
-
-
-def get_rf_results(rfmix_prefix_path, sample_ids=None):
-    main_pop_dict = {}; dfs = []
-    data_dir = Path(rfmix_prefix_path)
-    for i, fb_file in enumerate(data_dir.glob('*.fb.tsv')):
-        ##print(i) ## should monitor progress here
-        # Load data
-        dat = pl.scan_csv(fb_file, separator="\t", comment_char="#")
-        # Extract chromosome and pos
-        dfs.append(dat.select(dat.columns[:4]))
-        # Extract populations
-        pops = extract_comments(fb_file)[0].split()[1:]
-        # Mean haplotype per population
-        for pop_label in pops:
-            hap = combine_haplotypes(dat, pop_label, sample_ids)
-            if pop_label not in main_pop_dict:
-                main_pop_dict[pop_label] = hap
-            else:
-                main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
-    return pl.concat(dfs), main_pop_dict
-
+sample_ids = list(get_test_ids().BrNum.to_pandas())
+rfmix_prefix_path = "/dcs05/lieber/hanlab/jbenjami/projects/"+\
+    "localQTL_manuscript/local_ancestry_rfmix/_m/"
+################################################################
 
 class RFMixReader(object):
     def __init__(self, rfmix_prefix_path, select_samples=None,
@@ -102,85 +48,95 @@ class RFMixReader(object):
                   -o {rfmix_prefix_path}.chr$i \
                   --chromosome=chr$i
         """
-        # List all files with *fb.tsv
-        rf_pos, pop_dict = get_rf_results(rfmix_prefix_path)
-        
-        ## Count alleles per pop
-        #### TODO if 2 pops use only population
-        self.bim, self.fam, self.bed = read_plink(plink_prefix_path, verbose=verbose)
-        self.bed = 2 - self.bed  # flip allele order: PLINK uses REF as effect allele
-        if dtype == np.int8:
-            self.bed[np.isnan(self.bed)] = -9  # convert missing (NaN) to -9 for int8
-        self.bed = self.bed.astype(dtype, copy=False)
-        ## Select samples
-        self.sample_ids = self.fam['iid'].tolist()
-        if select_samples is not None:
-            ix = [self.sample_ids.index(i) for i in select_samples]
-            self.fam = self.fam.loc[ix]
-            self.bed = self.bed[:,ix]
-            self.sample_ids = self.fam['iid'].tolist()
-        ## Select chromosomes
+        self.sample_ids = select_samples
+        self.rf_pos, self.pop_dict = self.get_rf_results(rfmix_prefix_path,
+                                                         self.sample_ids)
+        if len(self.pop_dict.keys()) > 2:
+            raise ValueError('Admixture for only two populations')
+        self.pop = list(self.pop_dict.keys())[0]
+        self.hap = self.pop_dict[self.pop]
+        dat = pl.concat([self.rf_pos, self.hap], how="horizontal")
+        dat = dat.sort(pl.col("chrom").str.extract(r"chr([0-9]*)", 1).cast(int))
         if exclude_chrs is not None:
-            m = ~self.bim['chrom'].isin(exclude_chrs).values
-            self.bed = self.bed[m,:]
-            self.bim = self.bim[m]
-            self.bim.reset_index(drop=True, inplace=True)
-            self.bim['i'] = self.bim.index
-        self.n_samples = self.fam.shape[0]
-        self.chrs = list(self.bim['chrom'].unique())
-        self.variant_pos = {i:g['pos'] for i,g in self.bim.set_index('snp')[['chrom', 'pos']].groupby('chrom')}
-        self.variant_pos_dict = self.bim.set_index('snp')['pos'].to_dict()
+            dat = dat.filter(~pl.col('chrom').is_in(exclude_chrs))
+        self.rf_pos = dat.select(dat.columns[:3])
+        self.hap = dat.select(dat.columns[3:])
+        self.rf_pos = self.rf_pos.collect(streaming=True)
+        self.hap = self.hap.collect(streaming=True)
+        self.rf_pos = self.rf_pos.to_pandas()
+        self.rf_pos['i'] = self.rf_pos.index
+        self.hap = self.hap.to_pandas()
+        self.n_samples = self.hap.shape[1]
+        self.chrs = list(self.rf_pos['chrom'].unique())
+        self.hap_pos = {i:g['pos'] for i,g in self.rf_pos.set_index('hap_name')[['chrom', 'pos']].groupby('chrom')}
+        self.hap_pos_dict = self.rf_pos.set_index('hap_name')['pos'].to_dict()
 
-    def get_region_index(self, region_str, return_pos=False):
-        s = region_str.split(':')
-        chrom = s[0]
-        c = self.bim[self.bim['chrom'] == chrom]
-        if len(s) > 1:
-            start, end = s[1].split('-')
-            start = int(start)
-            end = int(end)
-            c = c[(c['pos'] >= start) & (c['pos'] <= end)]
-        if return_pos:
-            return c['i'].values, c.set_index('snp')['pos']
-        else:
-            return c['i'].values
+    def extract_comments(self, file_path, comment_char='#'):
+        comments = []
+        with open(file_path, 'r') as file:
+            for i, line in enumerate(file):
+                if i >= 5:
+                    break
+                stripped_line = line.strip()
+                if stripped_line.startswith(comment_char):
+                    comments.append(line.strip())
+        return comments
 
-    def get_region(self, region_str, sample_ids=None, impute=False, verbose=False, dtype=np.int8):
-        """Get genotypes for a region defined by 'chr:start-end' or 'chr'"""
-        ix, pos_s = self.get_region_index(region_str, return_pos=True)
-        g = self.bed[ix, :].compute().astype(dtype)
-        if sample_ids is not None:
-            ix = [self.sample_ids.index(i) for i in sample_ids]
-            g = g[:, ix]
-        if impute:
-            _impute_mean(g, verbose=verbose)
-        return g, pos_s
+    def extract_sample_name(self, col_name, pop_label):
+        pattern = rf'(.*?):::hap\d+:::{pop_label}'
+        m = re.match(pattern, col_name)
+        if m:
+            return m.group(1)
+        return None
 
-    def get_genotypes(self, variant_ids, sample_ids=None, impute=False, verbose=False, dtype=np.int8):
-        """Load genotypes for selected variant IDs"""
-        c = self.bim[self.bim['snp'].isin(variant_ids)]
-        g = self.bed[c.i.values, :].compute().astype(dtype)
-        if sample_ids is not None:
-            ix = [self.sample_ids.index(i) for i in sample_ids]
-            g = g[:, ix]
-        if impute:
-            _impute_mean(g, verbose=verbose)
-        return g, c.set_index('snp')['pos']
-
-    def get_genotype(self, variant_id, sample_ids=None, impute=False, verbose=False, dtype=np.int8):
-        """Load genotypes for a single variant ID as pd.Series"""
-        g,_ = self.get_genotypes([variant_id], sample_ids=sample_ids, impute=impute, verbose=verbose, dtype=dtype)
+    def combine_haplotypes(self, df, pop_label, sample_ids):
         if sample_ids is None:
-            return pd.Series(g[0], index=self.fam['iid'], name=variant_id)
+            sample_names = set(self.extract_sample_name(col, pop_label) for col in df.columns if self.extract_sample_name(col, pop_label) is not None)
         else:
-            return pd.Series(g[0], index=sample_ids, name=variant_id)
+            sample_names = sample_ids
+        dfs = []
+        for sample in sample_names:
+            hap1_col = f'{sample}:::hap1:::{pop_label}'
+            hap2_col = f'{sample}:::hap2:::{pop_label}'
+            if hap1_col in df.columns and hap2_col in df.columns:
+                dfx = df.select([hap1_col, hap2_col])\
+                        .with_columns((pl.col(hap1_col)+pl.col(hap2_col))\
+                                      .alias(sample))\
+                        .select([sample])
+                dfs.append(dfx)
+        return pl.concat(dfs, how="horizontal")
 
-    def load_genotypes(self):
-        """Load all genotypes into memory, as pd.DataFrame"""
-        return pd.DataFrame(self.bed.compute(), index=self.bim['snp'], columns=self.fam['iid'])
+    def get_rf_results(self, rfmix_prefix_path, sample_ids=None):
+        main_pop_dict = {}; dfs = []
+        data_dir = Path(rfmix_prefix_path)
+        for fb_file in data_dir.glob('*.fb.tsv'):
+            dat = pl.scan_csv(fb_file, separator="\t", comment_prefix="#")
+            dfs.append(dat.select(dat.columns[:2])\
+                       .rename({"chromosome":"chrom", "physical_position":"pos"})\
+                       .with_columns(
+                           pl.concat_str([pl.col('chrom'),pl.col('pos'),],
+                                         separator="_").alias("hap_name"))\
+                       .select(["hap_name", "chrom", "pos"]))
+            pops = self.extract_comments(fb_file)[0].split()[1:]
+            for pop_label in pops:
+                hap = self.combine_haplotypes(dat, pop_label, sample_ids)
+                if pop_label not in main_pop_dict:
+                    main_pop_dict[pop_label] = hap
+                else:
+                    main_pop_dict[pop_label] = pl.concat([main_pop_dict[pop_label],hap])
+        return pl.concat(dfs), main_pop_dict
+
+    def load_ancestry(self):
+        """Load all local ancestry into memory, as pd.DataFrame"""
+        return pd.DataFrame(self.hap, index=self.rf_pos['hap_name'])
 
 
-
+def load_ancestry(rfmix_path, select_samples=None):
+    """Load all local ancestry into a dataframe"""
+    rfr = RFMixReader(genotype_path, select_samples=select_samples, dtype=np.int8)
+    ancestry_df = rfr.load_ancestry()
+    position_df = rfr.rf_pos.set_index('hap_names')[['chrom', 'pos']]
+    return ancestry_df, position_df
 
 
 def print_progress(k, n, entity):
