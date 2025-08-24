@@ -19,8 +19,8 @@ except ImportError as e:
     pgen = None
 
 
-gt_to_dosage_dict = {'0/0':0, '0/1':1, '1/1':2, './.':np.NaN,
-                     '0|0':0, '0|1':1, '1|0':1, '1|1':2, '.|.':np.NaN}
+gt_to_dosage_dict = {'0/0':0, '0/1':1, '1/1':2, './.':np.nan,
+                     '0|0':0, '0|1':1, '1|0':1, '1|1':2, '.|.':np.nan}
 
 
 def _check_dependency(name):
@@ -47,14 +47,21 @@ class BackgroundGenerator(threading.Thread):
         self.start()
 
     def run(self):
-        for item in self.generator:
-            self.queue.put(item)
+        try:
+            for item in self.generator:
+                self.queue.put(item)
+        except Exception as exception:
+            self.queue.put(exception)
         self.queue.put(None)
 
     def next(self):
         next_item = self.queue.get()
         if next_item is None:
+            self.join()
             raise StopIteration
+        if isinstance(next_item, Exception):
+            self.join()
+            raise next_item
         return next_item
 
     def __next__(self):
@@ -445,6 +452,10 @@ class InputGeneratorCis(object):
             print(f'    ** dropping {np.sum(m)} constant phenotypes')
             self.phenotype_df = self.phenotype_df.loc[~m]
             self.phenotype_pos_df = self.phenotype_pos_df.loc[~m]
+
+        if len(self.phenotype_df) == 0:
+            raise ValueError("No phenotypes remain after filters.")
+
         self.group_s = None
         self.window = window
 

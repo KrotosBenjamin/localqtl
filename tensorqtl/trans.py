@@ -53,7 +53,7 @@ def filter_cis(pairs_df, phenotype_pos_df, variant_df, window=5000000):
 def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
               return_sparse=True, pval_threshold=1e-5, maf_threshold=0.05,
               alleles=2, return_r2=False, batch_size=20000,
-              logger=None, verbose=True):
+              logp=False, logger=None, verbose=True):
     """Run trans-QTL mapping
 
     Outputs (return_sparse == True):
@@ -155,7 +155,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         # post-processing: concatenate batches
         if return_sparse:
             res = np.concatenate(res)
-            res[:,2] = 2*stats.t.cdf(-np.abs(res[:,2].astype(np.float64)), dof)
+            res[:,2] = get_t_pval(res[:,2].astype(np.float64), dof, log=logp)
             pval_df = pd.DataFrame(res, columns=['variant_id', 'phenotype_id', 'pval', 'b', 'b_se', 'r2', 'af'])
             pval_df['pval'] = pval_df['pval'].astype(np.float64)
             pval_df['b'] = pval_df['b'].astype(np.float32)
@@ -168,7 +168,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
             return pval_df
         else:
             variant_ids = pd.Series(np.concatenate([i[0] for i in res]), name='variant_id')
-            pval_df = pd.DataFrame(2*stats.t.cdf(-np.abs(np.concatenate([i[1] for i in res]).astype(np.float64)), dof),
+            pval_df = pd.DataFrame(get_t_pval(np.concatenate([i[1] for i in res]).astype(np.float64), dof, log=logp),
                                    index=variant_ids, columns=phenotype_df.index)
             b_df = pd.DataFrame(np.concatenate([i[2] for i in res]),
                                 index=variant_ids, columns=phenotype_df.index)
@@ -182,10 +182,10 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
 
     else:  # interaction model
         dof = n_samples - 4 - covariates_df.shape[1]
-        interaction_t = torch.tensor(interaction_s.values.reshape(1,-1), dtype=torch.float32).to(device)
+        interaction_t = torch.tensor(interaction_s.values.reshape(1,-1), dtype=torch.float32).to(device)  # 1 x n_samples
         mask_s = pd.Series(True, index=interaction_s.index)
         mask_s[interaction_s.sort_values(kind='mergesort').index[:interaction_s.shape[0]//2]] = False
-        interaction_mask_t = torch.BoolTensor(mask_s).to(device)
+        interaction_mask_t = torch.BoolTensor(mask_s.values).to(device)
 
         ggt = genotypeio.GenotypeGeneratorTrans(genotype_df, batch_size=batch_size)
         start_time = time.time()
@@ -257,9 +257,9 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
             logger.write(f'    time elapsed: {(time.time()-start_time)/60:.2f} min')
 
             # concatenate
-            pval_g =  2*stats.t.cdf(-np.abs(np.concatenate(tstat_g_list)), dof)
-            pval_i =  2*stats.t.cdf(-np.abs(np.concatenate(tstat_i_list)), dof)
-            pval_gi = 2*stats.t.cdf(-np.abs(np.concatenate(tstat_gi_list)), dof)
+            pval_g =  get_t_pval(np.concatenate(tstat_g_list), dof, log=logp)
+            pval_i =  get_t_pval(np.concatenate(tstat_i_list), dof, log=logp)
+            pval_gi = get_t_pval(np.concatenate(tstat_gi_list), dof, log=logp)
             af = np.concatenate(af_list)
 
             pval_df = pd.DataFrame(np.c_[ix0, ix1, pval_g, pval_i, pval_gi, af],
@@ -273,7 +273,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
                 genotypes_t, mask_t = filter_maf_interaction(genotypes_t[:, genotype_ix_t],
                                                              interaction_mask_t=interaction_mask_t,
                                                              maf_threshold_interaction=maf_threshold)
-                res = calculate_interaction_nominal(genotypes_t, phenotypes_t, interaction_t, residualizer,
+                res = calculate_interaction_nominal(genotypes_t, phenotypes_t, interaction_t.t(), residualizer,
                                                     return_sparse=return_sparse)
                 # res: tstat, b, b_se, af, ma_samples, ma_count
                 res = [i.cpu().numpy() for i in res]
@@ -284,7 +284,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
 
             # concatenate outputs
             tstat = np.concatenate([i[0] for i in output_list])
-            pval = 2*stats.t.cdf(-np.abs(tstat), dof)
+            pval = get_t_pval(tstat, dof, log=logp)
             b = np.concatenate([i[1] for i in output_list])
             b_se = np.concatenate([i[2] for i in output_list])
             af = np.concatenate([i[3] for i in output_list])

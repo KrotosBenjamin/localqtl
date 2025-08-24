@@ -6,6 +6,18 @@ import scipy.optimize
 from scipy.special import loggamma
 import sys
 import re
+import subprocess
+
+# check R
+has_rpy2 = False
+try:
+    subprocess.check_call('which R', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.check_call("R -e 'library(qvalue)'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import rpy2
+    import rfunc
+    has_rpy2 = True
+except:
+    print("Warning: 'rfunc' cannot be imported. R with the 'qvalue' library and the 'rpy2' Python package are needed to compute q-values.")
 
 
 output_dtype_dict = {
@@ -150,6 +162,20 @@ def calculate_corr(genotype_t, phenotype_t, residualizer=None, return_var=False)
         return torch.mm(genotype_res_t, phenotype_res_t.t()), genotype_var_t, phenotype_var_t
     else:
         return torch.mm(genotype_res_t, phenotype_res_t.t())
+
+
+def get_t_pval(t, df, log=False):
+    """
+    Get p-value corresponding to t statistic and degrees of freedom (df). t and/or df can be arrays.
+    If log=True, returns -log10(P).
+    """
+    if not log:
+        return 2 * stats.t.cdf(-abs(t), df)
+    else:
+        if has_rpy2:
+            return -(rfunc.t_cdf(-abs(t), df, lower_tail=True, log=True) + np.log(2)) * np.log10(np.e)
+        else:
+            raise ValueError("R and rpy2 are required to compute -log10(P)")
 
 
 def calculate_interaction_nominal(genotypes_t, phenotypes_t, interaction_t, residualizer=None,
@@ -310,17 +336,17 @@ def filter_covariates(covariates_t, log_counts_t, tstat_threshold=2):
 #------------------------------------------------------------------------------
 #  Functions for beta-approximating empirical p-values
 #------------------------------------------------------------------------------
-def pval_from_corr(r2, dof):
+def pval_from_corr(r2, dof, logp=False):
     tstat2 = dof * r2 / (1 - r2)
-    return 2*stats.t.cdf(-np.abs(np.sqrt(tstat2)), dof)
+    return get_t_pval(np.sqrt(tstat2), dof, log=logp)
 
 
-def df_cost(r2, dof):
-    """minimize abs(1-alpha) as a function of M_eff"""
+def beta_shape_1_from_dof(r2, dof):
+    """compute the Beta shape 1 parameter from moment matching"""
     pval = pval_from_corr(r2, dof)
     mean = np.mean(pval)
     var = np.var(pval)
-    return mean * (mean * (1.0-mean) / var - 1.0) - 1.0
+    return mean * (mean * (1.0-mean) / var - 1.0)
 
 
 def beta_log_likelihood(x, shape1, shape2):
@@ -335,10 +361,19 @@ def fit_beta_parameters(r2_perm, dof_init, tol=1e-4, return_minp=False):
       dof_init:   degrees of freedom
     """
     try:
-        true_dof = scipy.optimize.newton(lambda x: df_cost(r2_perm, x), dof_init, tol=tol, maxiter=50)
+        # Find the degrees of freedom such that the first beta parameter is
+        # close to 1, by finding the root where the log of the beta parameter
+        # as a function of r2_perm and dof is 0.  Optimizing log(beta shape 1)
+        # with a parameterization of log(dof) makes this close to a linear
+        # function.
+        log_true_dof = scipy.optimize.newton(lambda x: np.log(beta_shape_1_from_dof(r2_perm, np.exp(x))),
+                                             np.log(dof_init), tol=tol, maxiter=50)
+        true_dof = np.exp(log_true_dof)
     except:
+        # fall back to minimization
         print('WARNING: scipy.optimize.newton failed to converge (running scipy.optimize.minimize)')
-        res = scipy.optimize.minimize(lambda x: np.abs(df_cost(r2_perm, x)), dof_init, method='Nelder-Mead', tol=tol)
+        res = scipy.optimize.minimize(lambda x: np.abs(beta_shape_1_from_dof(r2_perm, x) - 1),
+                                      dof_init, method='Nelder-Mead', tol=tol)
         true_dof = res.x[0]
 
     pval = pval_from_corr(r2_perm, true_dof)
@@ -385,7 +420,7 @@ def read_phenotype_bed(phenotype_bed):
 
     # make sure BED file is properly sorted
     assert pos_df.equals(
-        pos_df.groupby('chr', sort=False, group_keys=False).apply(lambda x: x.sort_values(['start', 'end']))
+        pos_df.groupby('chr', sort=False, group_keys=False)[pos_df.columns].apply(lambda x: x.sort_values(['start', 'end']))
     ), "Positions in BED file must be sorted."
 
     if (pos_df['start'] == pos_df['end']).all():
