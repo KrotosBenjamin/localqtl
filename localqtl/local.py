@@ -1,667 +1,533 @@
-# This script process local ancestry data generated from
-# RFMix v2.
-# Documentation improved with LLM AI
-__author__ = "Kynon J Benjamin"
+"""
+GPU-enabled utilities to incorporate local ancestry (RFMix) into tensorQTL-style
+cis mapping. Provides:
+  - RFMixReader: aligns RFMix local-ancestry to genotype variant order (lazy via dask/zarr)
+  - get_cis_ranges: computes per-phenotype cis windows for BOTH variants and haplotypes
+  - InputGeneratorCis: background-prefetched batch generator that yields
+      phenotype, variants slice, haplotypes slice, their index ranges, and IDs
 
-from genotypeio import background
+Notes
+-----
+- Designed for large-scale GPU eQTL with CuPy/cuDF where possible.
+- Avoids materialization; uses dask-backed arrays and cuDF slicing.
+- Compatible with original tensorQTL patterns while adding local ancestry.
 
-from dask.array import from_array
-from cupy import int8, array, int32
-from cudf import DataFrame, Series, from_pandas
+Author: Kynon J Benjamin (refactor by assistant per user request)
+"""
+from __future__ import annotations
+
+# ----------------------------
+# Imports
+# ----------------------------
+import bisect, sys
+import numpy as np
+import pandas as pd
+from typing import Dict, Iterable, List, Optional, Tuple, Union
+
+import dask.array as da
+from dask.array import from_array, from_zarr
+
+import cupy as cp
+from cupy import int8, int32
+
+import cudf
+from cudf import DataFrame as cuDF, Series as cuSeries
+
+from tensorqtl.genotypeio import background
 from rfmix_reader import read_rfmix, interpolate_array
 
-################### testing #############################
 
+ArrayLike = Union[np.ndarray, cp.ndarray, da.core.Array]
 
-def get_test_ids():
-    from cudf import read_csv
-    test_ids = "../example/sample_id_to_brnum.tsv"
-    return read_csv(test_ids, sep="\t", usecols=[1])
-
-
-def _load_genotypes(plink_prefix_path):
-    import pgen
-    pgr = pgen.PgenReader(plink_prefix_path)
-    variant_df = pgr.variant_df
-    variant_df.loc[:, "chrom"] = "chr" + variant_df.chrom
-    return pgr.load_genotypes(), variant_df
-
-
-def test_data():
-    select_samples = list(get_test_ids().BrNum.to_pandas())
-    basename = "/projects/b1213/resources"
-    prefix_path = f"{basename}/processed-data/local-ancestry/rfmix-version/_m/"
-    binary_dir = f"{prefix_path}/binary_files"
-    plink_prefix = f"{basename}/libd_data/genotypes/combined_data/AA_EA/_m/TOPMed_LIBD"
-    #loci, rf_q, admix = read_rfmix(prefix_path,verbose=True,binary_dir=binary_dir)
-    genotype_df, variant_df = _load_genotypes(plink_prefix)
-    rfr = RFMixReader(prefix_path, variant_df, select_samples=select_samples)
-
-########################################################
-
-
-class RFMixReader(object):
-    """
-    Class for reading loci from RFMix files.
+# ----------------------------
+# RFMixReader (refined)
+# ----------------------------
+class RFMixReader:
+    """Read and align RFMix local ancestry to variant grid.
 
     Parameters
     ----------
     prefix_path : str
-        The prefix path to the RFMix files (e.g., fb.tsv, rfmix.Q).
-    variant_df : pandas.DataFrame
-        Expecting variant DataFrame that matches genotype locations.
-    select_samples : list of str, optional
-        A list of sample IDs to select a subset of samples.
-        If None, all samples are included.
-    exclude_chrs : list of str, optional
-        A list of chromosome names to exclude from the data.
-        If None, no chromosomes are excluded.
-    binary_dir_name : str, optional
-        The directory name where the binary files are stored.
-        Defaults to "binary_files".
-    verbose : bool, optional
-        Whether to print verbose messages during processing.
-        Defaults to True.
-    dtype : cupy.dtype, optional
-        The data type to use for numerical arrays. Defaults to cupy.int8.
+        Directory containing RFMix per-chrom outputs and fb.tsv.
+    variant_df : pd.DataFrame
+        DataFrame with columns ['chrom', 'pos'] in the SAME order as the
+        genotype matrix (variants x samples).
+    select_samples : list[str], optional
+        Subset of sample IDs to keep (order preserved).
+    exclude_chrs : list[str], optional
+        Chromosomes to exclude from imputed matrices.
+    binary_dir_name : str
+        Directory name with prebuilt binary files (default: "binary_files").
+    verbose : bool
+    dtype : cupy dtype
 
-    Notes
-    -----
-    Use the following command to generate RFMix files per chromosome:
-        rfmix -f {rfmix_prefix_path}.vcf.gz \
-              -r {reference.vcf.gz} \
-              -m {samples_ids} \
-              -g {genetic_map} \
-              -o {rfmix_prefix_path}.chr$i \
-              --chromosome=chr$i
-
-    Use the following command to convert and generate binary files
-    on the command line:
-        create-binaries "./" --binary_dir "binary_files"
-
-    In Python:
-        create_binaries(file_path, binary_dir)
-
-    This class uses the `read_rfmix` function from `rfmix_reader`.
+    Attributes
+    ----------
+    loci : cuDF
+        Imputed loci aligned to variants (columns: ['chrom','pos','i','hap']).
+    admix : dask.array
+        Dask array (loci x (n_samples * n_pops)) or shaped after selection.
+    rf_q : cuDF
+        Sample metadata table from RFMix (contains 'sample_id', 'chrom').
+    sample_ids : list[str]
+    n_pops : int
+    hap_df : pd.DataFrame
+        Mapping hap_id -> (chrom, pos, index) for fast lookups.
+    hap_dfs : dict[str, pd.DataFrame]
+        Per-chrom position/index tables for windowing.
     """
-    def __init__(self, prefix_path, variant_df, select_samples=None,
-                 exclude_chrs=None, binary_dir_name="binary_files",
-                 verbose=True, dtype=int8):
-        """
-        Initialize the RFMixReader object.
-        """
-        bin_dir = f"{prefix_path}/{binary_dir_name}"
+
+    def __init__(
+        self, prefix_path: str, variant_df: pd.DataFrame,
+        select_samples: Optional[List[str]] = None,
+        exclude_chrs: Optional[List[str]] = None,
+        binary_dir_name: str = "binary_files",
+        verbose: bool = True, dtype=int8,
+    ):
         self.zarr_dir = f"{prefix_path}"
-        loci, self.rf_q, admix = read_rfmix(prefix_path,
-                                            binary_dir=bin_dir,
+        bin_dir = f"{prefix_path}/{binary_dir_name}"
+
+        loci, self.rf_q, admix = read_rfmix(prefix_path, binary_dir=bin_dir,
                                             verbose=verbose)
         loci = loci.rename(columns={"chromosome": "chrom",
                                     "physical_position": "pos"})
+
+        # Ensure unique variant positions for merge/alignment
         variant_df = variant_df.drop_duplicates(subset=["chrom", "pos"],
-                                                keep='first')
-        variant_loci = variant_df.merge(self.__class__.to_pandas(loci),
-                                        on=["chrom", "pos"],
-                                        how="outer", indicator=True)\
-                                 .loc[:, ["chrom", "pos", "i", "_merge"]]
-        # Imputated data
-        z = interpolate_array(variant_loci, admix, self.zarr_dir)
-        daz = from_zarr(f"{self.zarr_dir}/local-ancestry.zarr")
-        idx_arr = from_array(variant_loci[~(variant_loci["_merge"] ==
-                                            "right_only")].index.to_numpy())
-        self.admix = daz[idx_arr]
-        mask = Series(False, index=variant_loci.index)
-        mask.loc[idx_arr] = True
-        variant_loci = from_pandas(variant_loci)
-        self.loci = variant_loci[mask].drop(["i", "_merge"], axis=1)\
-                                      .reset_index(drop=True)
-        self.loci["i"] = Series(range(len(self.loci)))
-        # Create a haplotype ID column by concatenating chromosome and
-        # physical position
-        self.loci["hap"] = self.loci['chrom'].astype(str) + '_' + self.loci['pos'].astype(str)
-        # Select samples from chromosome 1 for gsam
-        self.gsam = self.rf_q[(self.rf_q["chrom"] == "chr1")].copy()
-        self.n_loci = loci.shape[0]
-        self.n_loci_imputed = self.loci.shape[0]
-        # Get sample IDs
-        self.sample_ids = self._get_sample_ids(self.gsam)
-        self.n_pops = self._get_n_pop()
-        # Select a subset of samples if specified
+                                                keep="first").copy()
+
+        # Align variant grid with available loci (allow imputation for missing)
+        # Merge retains full variant grid; keep indices for direct selection
+        variant_loci = (
+            variant_df.merge(_to_pandas(loci), on=["chrom", "pos"], how="outer",
+                             indicator=True)
+            .loc[:, ["chrom", "pos", "i", "_merge"]]
+        )
+
+        # Drive imputation to build a complete ancestry grid aligned to variants
+        _ = interpolate_array(variant_loci, admix, self.zarr_dir)
+        daz = from_zarr(f"{self.zarr_dir}/local-ancestry.zarr")  # (variants_aligned x samples*pops)
+
+        # Indices present in original loci (not right_only) to map back
+        idx_arr = from_array(
+            variant_loci[~(variant_loci["_merge"] == "right_only")].index.to_numpy()
+        )
+        self.admix = daz[idx_arr]  # dask view, lazy
+
+        # Build cuDF mask to select aligned rows; drop helper cols
+        mask = cudf.Series(False, index=variant_loci.index)
+        mask.loc[idx_arr.compute()] = True
+        variant_loci = cudf.from_pandas(variant_loci)
+        self.loci = (
+            variant_loci[mask]
+            .drop(["i", "_merge"], axis=1)
+            .reset_index(drop=True)
+        )
+        self.loci["i"] = cudf.Series(range(len(self.loci)))
+        self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
+
+        # Use all samples by default; allow subsetting
+        self.sample_ids = _get_sample_ids(self.rf_q)
         if select_samples is not None:
             ix = [self.sample_ids.index(i) for i in select_samples]
-            self.gsam = self.gsam.loc[ix].copy()
             self.admix = self.admix[:, ix]
-            self.sample_ids = self._get_sample_ids(self.gsam)
-        # Exclude specified chromosomes
+            self.rf_q = self.rf_q.loc[ix].reset_index(drop=True)
+            self.sample_ids = _get_sample_ids(self.rf_q)
+
+        # Exclude chromosomes if requested
         if exclude_chrs is not None:
-            mask = ~self.loci['chrom'].isin(exclude_chrs)
+            mask = ~self.loci["chrom"].isin(exclude_chrs)
             self.admix = self.admix[mask.values, :]
-            self.loci = self.loci[mask].copy()
-            self.loci.reset_index(drop=True, inplace=True)
-            self.loci['i'] = self.loci.index
-        # Currently works for 2 populations only
-        self.n_samples = self.gsam.shape[0]  # * self.n_pop
-        # Get unique chromosomes
-        self.chrs = self._get_chroms(self.loci)
-        # Create haplotype dataframe
-        hap_df = self.loci.set_index('hap')[['chrom', 'pos']]
-        hap_df['index'] = arange(hap_df.shape[0])
-        self.hap_df = hap_df
-        self.hap_dfs = {c:g[['pos', 'index']] for c,g in hap_df.groupby('chrom', sort=False)}
+            self.loci = self.loci[mask].copy().reset_index(drop=True)
+            self.loci["i"] = self.loci.index
 
-    @staticmethod
-    def to_pandas(df):
-        return df.to_pandas() if isinstance(df, DataFrame) else df
-
-    def _get_sample_ids(self, df):
-        """
-        Get sample IDs from a DataFrame.
-
-        Parameters
-        ----------
-        df : cudf.DataFrame or pd.DataFrame
-            The DataFrame containing sample IDs.
-
-        Returns
-        -------
-        list of str
-            A list of sample IDs.
-        """
-        if isinstance(df, (DataFrame, Series)):
-            return df["sample_id"].to_arrow().tolist()
-        else:
-            return df["sample_id"].tolist()
-
-    def _get_chroms(self, loci):
-        """
-        Get unique chromosomes from the imputed loci DataFrame.
-
-        Parameters
-        ----------
-        loci : cudf.DataFrame
-            The loci DataFrame.
-
-        Returns
-        -------
-        list of str
-            A list of unique chromosome names.
-        """
-        return loci["chrom"].to_pandas().tolist()
-
-    def _get_n_pop(self):
-        """
-        Calculate and return the number of populations.
-
-        Returns:
-        --------
-        int
-            The number of populations in the data.
-
-        Notes:
-        ------
-        This method assumes that the number of columns in self.admix
-        is a multiple of the number of samples. It divides the number
-        of columns in self.admix by the number of samples to get the
-        number of populations.
-        """
+        # Populations inferred from columns
         n_samples = len(self.sample_ids)
-        if n_samples == 0:
-            raise ValueError("No samples found in the data.")
-        n_columns = self.admix.shape[1]
-        if n_columns % n_samples != 0:
-            raise ValueError(
-                "The number of columns in imputed admix data is not a multiple of the number of samples.")
-        return n_columns // n_samples
+        n_cols = self.admix.shape[1]
+        if (n_cols % n_samples) != 0:
+            raise ValueError("Admix columns not multiple of n_samples; cannot infer n_pops.")
+        self.n_pops = n_cols // n_samples
 
-    def get_region_index(self, region_str, return_pos=False):
-        """
-        Get the indices for a specified genomic region.
-
-        Parameters
-        ----------
-        region_str : str
-            A string specifying the genomic region (e.g.,
-            'chr1:1000-2000' or 'chr1').
-        return_pos : bool, optional
-            Whether to return physical positions along with indices.
-            Defaults to False.
-
-        Returns
-        -------
-        indices : numpy.ndarray or dask.array.core.Array
-            The indices corresponding to the specified genomic region.
-        pos_s : pandas.Series or cudf.Series, optional
-            The physical positions corresponding to the specified
-            genomic region if return_pos is True.
-        """
-        s = region_str.split(':')
-        chrom = s[0]
-        c = self.loci[self.loci['chrom'] == chrom]
-        if len(s) > 1:
-            start, end = map(int, s[1].split('-'))
-            c = c[(c['pos'] >= start)
-                  & (c['pos'] <= end)]
-        indices = c.index.values
-        if return_pos:
-            return indices, c.set_index('hap')['pos']
-        else:
-            return indices
-
-    def get_region(self, region_str, sample_ids=None, verbose=False,
-                   dtype=int8):
-        """
-        Get the genotype data for a specified genomic region.
-
-        Parameters
-        ----------
-        region_str : str
-            A string specifying the genomic region. It can be in the
-            format 'chrX' or 'chrX:start-end'. For example, 'chr1' or
-            'chr1:1000-2000'.
-        sample_ids : list of str, optional
-            A list of sample IDs to include in the result.
-            If None, all samples are included.
-    verbose : bool, optional
-            Whether to print verbose messages during processing.
-            Defaults to False.
-        dtype : cupy.dtype, optional
-            The data type to use for the returned genotype array.
-            Defaults to cupy.int8.
-
-        Returns
-        -------
-        g : numpy.ndarray
-            The genotype data for the specified genomic region.
-        pos_s : pandas.Series or cudf.Series
-            The physical positions corresponding to the loci in the
-            specified genomic region.
-
-        Notes
-        -----
-        This method uses the `get_region_index` method to obtain the
-        indices of the loci within the specified region and then
-        extracts the corresponding genotype data from `self.admix`.
-
-        Examples
-        --------
-        >>> reader = RFMixReader('path/to/prefix')
-        >>> genotypes, positions = reader.get_region('chr1:1000-2000')
-        >>> print(genotypes.shape)
-        >>> print(positions.head())
-        """
-        ix, pos_s = self.get_region_index(region_str, return_pos=True)
-        g = self.admix[ix].compute().astype(dtype)
-        if sample_ids is not None:
-            sample_indices = [self.sample_ids.index(i) for i in sample_ids]
-            g = g[:, sample_indices]
-        return g, pos_s
-
-    def get_loci(self, haplotype_ids, sample_ids=None, verbose=False,
-                 dtype=int8):
-        """
-        Get the genotype data for a list of specified haplotype IDs.
-
-        Parameters
-        ----------
-        haplotype_ids : list of str
-            A list of haplotype IDs to retrieve genotype data for.
-        sample_ids : list of str, optional
-            A list of sample IDs to include in the result.
-            If None, all samples are included.
-        verbose : bool, optional
-            Whether to print verbose messages during processing.
-            Defaults to False.
-        dtype : cupy.dtype, optional
-            The data type to use for the returned genotype array.
-            Defaults to cupy.int8.
-
-        Returns
-        -------
-        g : numpy.ndarray
-            The genotype data for the specified haplotype IDs.
-        pos_s : pandas.Series or cudf.Series
-            The physical positions corresponding to the specified
-            haplotype IDs.
-
-        Notes
-        -----
-        This method filters the loci based on the provided haplotype IDs
-        and extracts the corresponding genotype data from `self.admix`.
-
-        Examples
-        --------
-        >>> reader = RFMixReader('path/to/prefix')
-        >>> genotypes, positions = reader.get_loci(['chr1_1000', 'chr1_2000'])
-        >>> print(genotypes.shape)
-        >>> print(positions.head())
-        """
-        c = self.loci[self.loci['hap'].isin(haplotype_ids)]
-        indices = c.index.values
-        g = self.admix[indices].compute().astype(dtype)
-        if sample_ids is not None:
-            sample_indices = [self.sample_ids.index(i) for i in sample_ids]
-            g = g[:, sample_indices]
-        return g, c.set_index('hap')['pos']
-
-    def get_locus(self, haplotype_id, sample_ids=None, verbose=False,
-                  dtype=int8):
-        """
-        Get the genotype data for a single specified haplotype ID.
-
-        Parameters
-        ----------
-        haplotype_id : str
-            The haplotype ID to retrieve genotype data for.
-        sample_ids : list of str, optional
-            A list of sample IDs to include in the result.
-            If None, all samples are included.
-        verbose : bool, optional
-            Whether to print verbose messages during processing.
-            Defaults to False.
-        dtype : cupy.dtype, optional
-            The data type to use for the returned genotype array.
-            Defaults to cupy.int8.
-
-        Returns
-        -------
-        g : pandas.Series or cudf.Series
-            The genotype data for the specified haplotype ID as a
-            pandas Series or cudf.Series.
-
-        Notes
-        -----
-        This method filters the loci based on the provided haplotype ID
-        and extracts the corresponding genotype data from `self.admix`.
-        It returns a pandas or cuDF Series with sample IDs as the index.
-
-        Examples
-        --------
-        >>> reader = RFMixReader('path/to/prefix')
-        >>> genotypes = reader.get_locus('chr1_1000')
-        >>> print(genotypes.head())
-        """
-        g, _ = self.get_loci([haplotype_id], sample_ids=sample_ids,
-                             verbose=verbose, dtype=dtype)
-        if sample_ids is None:
-            return Series(g[0], index=self.sample_ids, name=haplotype_id)
-        else:
-            return Series(g[0], index=sample_ids, name=haplotype_id)
-
-    def load_loci(self):
-        """
-        Load all loci into memory as a pandas DataFrame.
-
-        Returns
-        -------
-        DataFrame : pandas.Dataframe or cudf.DataFrame
-            A pandas or cudf DataFrame containing all genotype data with
-            haplotype IDs as the index and sample IDs as the columns.
-
-        Notes
-        -----
-        This method loads the entire genotype data into memory, which
-        can be memory-intensive for large datasets.
-        It is recommended to use this method only when necessary and
-        when sufficient memory is available.
-
-        Examples
-        --------
-        >>> reader = RFMixReader('path/to/prefix')
-        >>> genotypes_df = reader.load_loci()
-        >>> print(genotypes_df.head())
-        """
-        return DataFrame(self.admix.compute(), index=self.loci['hap'],
-                            columns=self.sample_ids)
+        # Haplotype lookup frames (CPU pandas for bisect speed)
+        hap_df = self.loci.to_pandas().set_index("hap")[['chrom', 'pos']]
+        hap_df['index'] = np.arange(hap_df.shape[0])
+        self.hap_df = hap_df
+        self.hap_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
+                        for c, g in hap_df.reset_index().groupby('chrom', sort=False)}
 
 
-def load_imputed_loci(prefix_path, variant_df, select_samples=None,
-                      binary_dir_name="binary_files"):
-    """
-    Load loci data from RFMix files and return the genotype data
-    along with haplotype information.
+# ----------------------------
+# Helpers functions
+# ----------------------------
+def _to_pandas(df: Union[cuDF, pd.DataFrame]) -> pd.DataFrame:
+    return df.to_pandas() if isinstance(df, cuDF) else df
 
-    Parameters
-    ----------
-    prefix_path : str
-        The prefix path to the RFMix files (e.g., fb.tsv, rfmix.Q).
-    select_samples : list of str, optional
-        A list of sample IDs to select a subset of samples.
-        If None, all samples are included.
-    binary_dir_name : str, optional
-        The directory name where the binary files are stored.
-        Defaults to "binary_files".
+
+def _get_sample_ids(df: Union[cuDF, pd.DataFrame]) -> List[str]:
+    if isinstance(df, (cuDF, cuSeries)):
+        return df["sample_id"].to_arrow().to_pylist()
+    return df["sample_id"].tolist()
+
+
+# -------------------------------------------------
+# cis-window computation for variants + haplotypes
+# -------------------------------------------------
+def get_cis_ranges(
+    phenotype_pos_df: pd.DataFrame,
+    chr_variant_dfs: Dict[str, pd.DataFrame],
+    chr_haplotype_dfs: Dict[str, pd.DataFrame],
+    window: int, require_both: bool = True, verbose: bool = True,
+) -> Tuple[Dict[str, Dict[str, Tuple[int, int]]], List[str]]:
+    """Compute per-phenotype cis index ranges for variants and haplotypes.
 
     Returns
     -------
-    loci_df : pandas.DataFrame
-        A pandas DataFrame containing all genotype data with
-        haplotype IDs as the index and sample IDs as the columns.
-    hap_df : pandas.DataFrame
-        A pandas DataFrame containing haplotype information with
-        'hap' as the index and columns 'chromosome' and 'pos'.
-
-    Notes
-    -----
-    This function uses the `RFMixReader` class to read RFMix
-    files and load the genotype data into memory.
-    It also extracts haplotype information from the `RFMixReader` object.
-
-    Examples
-    --------
-    >>> loci_df, hap_df = load_loci('path/to/prefix', select_samples=['sample1', 'sample2'])
-    >>> print(loci_df.head())
-    >>> print(hap_df.head())
+    cis_ranges : dict
+        phenotype_id -> {"variants": (lb, ub), "haplotypes": (lb, ub)} (inclusive ranges)
+    drop_ids : list[str]
+        Phenotypes without any eligible window (based on `require_both`).
     """
-    rfr = RFMixReader(prefix_path, variant_df, select_samples=select_samples,
-                      binary_dir_name=binary_dir_name)
-    hap_df = rfr.loci.set_index('hap')[['chrom', 'pos']]
-    loci_df = rfr.load_loci()
-    return loci_df, hap_df
+    # Normalize phenotype_pos_df to have ['chr','start','end']
+    if 'pos' in phenotype_pos_df.columns:
+        pp = phenotype_pos_df.rename(columns={'pos': 'start'}).copy()
+        pp['end'] = pp['start']
+    else:
+        pp = phenotype_pos_df.copy()
 
+    # Ensure dict-of-records for speed
+    phenotype_pos_dict = pp.to_dict(orient='index')
 
-def get_cis_ranges(phenotype_pos_df, chr_variant_dfs,
-                   chr_haplotype_dfs, window, verbose=True):
-    """
-    Calculate genotype and haplotype ranges within the cis-window.
+    cis_ranges: Dict[str, Dict[str, Tuple[int, int]]] = {}
+    drop_ids: List[str] = []
 
-    Parameters:
-        phenotype_pos_df: DataFrame defining position of each phenotype.
-        chr_variant_dfs: Dictionary of DataFrames mapping variant positions to
-                         indices, grouped by chromosome.
-        chr_haplotype_dfs: Dictionary of DataFrames mapping haplotype positions
-                           to indices, grouped by chromosome.
-        window: The size of the cis-window.
-        verbose: Whether to print progress.
+    # Pre-extract numpy arrays for bisect per chromosome
+    var_pos = {c: df['pos'].to_numpy() for c, df in chr_variant_dfs.items()}
+    var_idx = {c: df['index'].to_numpy() for c, df in chr_variant_dfs.items()}
+    hap_pos = {c: df['pos'].to_numpy() for c, df in chr_haplotype_dfs.items()}
+    hap_idx = {c: df['index'].to_numpy() for c, df in chr_haplotype_dfs.items()}
 
-    Returns:
-        cis_ranges: Dictionary of genotype index ranges for each phenotype.
-        drop_ids: List of phenotype IDs without variants or haplotypes in the cis-window.
-    """
-    # check phenotypes & calculate genotype and loci ranges
-    if 'pos' in phenotype_pos_df:
-        phenotype_pos_df = phenotype_pos_df.rename(columns={'pos':'start'})
-        phenotype_pos_df['end'] = phenotype_pos_df['start']
-    phenotype_pos_dict = phenotype_pos_df.to_dict(orient='index')
-
-    drop_ids = []
-    cis_ranges = {}
-    n = len(phenotype_pos_df)
-    for k, phenotype_id in enumerate(phenotype_pos_df.index, 1):
+    ids = list(phenotype_pos_df.index)
+    n = len(ids)
+    for k, pid in enumerate(ids, 1):
         if verbose and (k % 1000 == 0 or k == n):
-            print(f'\r  * checking phenotypes: {k}/{n}',  end='' if k != n else None)
-
-        pos = phenotype_pos_dict[phenotype_id]
+            print(f"\r  * checking phenotypes: {k}/{n}", end='' if k != n else None)
+        pos = phenotype_pos_dict[pid]
         chrom = pos['chr']
 
-        # Check for variants within cis-window
-        if chrom in chr_variant_dfs:
-            variant_m = len(chr_variant_dfs[chrom]['pos'].values)
-            variant_lb = bisect.bisect_left(chr_variant_dfs[chrom]['pos'].values, pos['start'] - window)
-            variant_ub = bisect.bisect_right(chr_variant_dfs[chrom]['pos'].values, pos['end'] + window)
-            if variant_lb != variant_ub:
-                variant_r = chr_variant_dfs[chrom]['index']\
-                    .values[[variant_lb, variant_ub - 1]]
-            else:
-                variant_r = []
+        # Variants
+        if chrom in var_pos:
+            lb = bisect.bisect_left(var_pos[chrom], pos['start'] - window)
+            ub = bisect.bisect_right(var_pos[chrom], pos['end'] + window) - 1
+            variant_r = (var_idx[chrom][lb], var_idx[chrom][ub]) if lb <= ub else None
         else:
-            variant_r = []
+            variant_r = None
 
-        # Check for haplotypes within cis-window
-        if chrom in chr_haplotype_dfs:
-            haplotype_m = len(chr_haplotype_dfs[chrom]['pos'].values)
-            haplotype_lb = bisect.bisect_left(chr_haplotype_dfs[chrom]['pos'].values, pos['start'] - window)
-            haplotype_ub = bisect.bisect_right(chr_haplotype_dfs[chrom]['pos'].values, pos['end'] + window)
-            if haplotype_lb != haplotype_ub:
-                haplotype_r = chr_haplotype_dfs[chrom]['index']\
-                    .values[[haplotype_lb, haplotype_ub - 1]]
-            else:
-                haplotype_r = []
+        # Haplotypes
+        if chrom in hap_pos:
+            lb = bisect.bisect_left(hap_pos[chrom], pos['start'] - window)
+            ub = bisect.bisect_right(hap_pos[chrom], pos['end'] + window) - 1
+            haplotype_r = (hap_idx[chrom][lb], hap_idx[chrom][ub]) if lb <= ub else None
         else:
-            haplotype_r = []
+            haplotype_r = None
 
-        # Check if both variants and haplotypes exists
-        if len(variant_r) > 0 and len(haplotype_r) > 0:
-            cis_ranges[phenotype_id] = {
-                "variants": variant_r,
-                "haplotypes": haplotype_r
-            }
+        ok = (variant_r is not None) and (haplotype_r is not None) if require_both \
+             else (variant_r is not None) or (haplotype_r is not None)
+        if ok:
+            cis_ranges[pid] = {"variants": variant_r, "haplotypes": haplotype_r}
         else:
-            drop_ids.append(phenotype_id)
+            drop_ids.append(pid)
 
     return cis_ranges, drop_ids
 
 
-class InputGeneratorCis(object):
-    """
-    Input generator for cis-mapping
+# ----------------------------
+# Input generator (refactored)
+# ----------------------------
+class InputGeneratorCis:
+    """Input generator for cis mapping (variants + local ancestry haplotypes).
 
-    Inputs:
-      genotype_df:      genotype DataFrame (genotypes x samples)
-      variant_df:       DataFrame mapping variant_id (index) to chrom, pos
-      loci_df:          admixture loci DataFrame (loci x samples)
-      hap_df:           DataFrame mapping hap_id (index) to chrom, pos
-      phenotype_df:     phenotype DataFrame (phenotypes x samples)
-      phenotype_pos_df: DataFrame defining position of each phenotype, with columns ['chr', 'pos'] or ['chr', 'start', 'end']
-      window:           cis-window; selects variants within +- cis-window from 'pos' (e.g., TSS for gene-based features)
-                        or within [start-window, end+window] if 'start' and 'end' are present in phenotype_pos_df
+    Inputs
+    ------
+    genotype_df : (variants x samples) DataFrame (pd or cuDF)
+    variant_df  : DataFrame mapping variant index to ['chrom','pos'] (sorted by genotype row order)
+    phenotype_df: (phenotypes x samples) DataFrame
+    phenotype_pos_df: DataFrame with ['chr','pos'] or ['chr','start','end'] indexed by phenotype_id
+    loci_df     : (haplotypes x samples) DataFrame aligned to hap_df order
+    hap_df      : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching loci_df
+    group_s     : optional pd.Series mapping phenotype_id -> group_id
+    window      : cis window size
 
-    Generates: phenotype array, genotype array (2D), cis-window indices, phenotype ID
+    Generates (ungrouped)
+    --------------------
+    phenotype (1D), variants (2D slice), variants_index (1D),
+    haplotypes (2D slice), haplotypes_index (1D), phenotype_id
+
+    Notes
+    -----
+    - Uses background prefetch for overlap with compute.
+    - Returns GPU arrays (CuPy) if as_cupy=True, else returns DataFrames.
     """
-    def __init__(self, genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-                 loci_df, hap_df, group_s=None, window=1000000):
+
+    def __init__(
+        self,
+        genotype_df: Union[pd.DataFrame, cuDF],
+        variant_df: pd.DataFrame,
+        phenotype_df: Union[pd.DataFrame, cuDF],
+        phenotype_pos_df: pd.DataFrame,
+        loci_df: Union[pd.DataFrame, cuDF],
+        hap_df: pd.DataFrame,
+        group_s: Optional[pd.Series] = None,
+        window: int = 1_000_000,
+        require_both: bool = True,
+    ):
+        # Store
         self.genotype_df = genotype_df
         self.variant_df = variant_df.copy()
-        self.variant_df['index'] = np.arange(variant_df.shape[0])
+        self.variant_df['index'] = np.arange(self.variant_df.shape[0])
+
         self.loci_df = loci_df
         self.hap_df = hap_df.copy()
-        self.hap_df["index"] = np.arange(hap_df.shape[0])
-        self.n_samples = phenotype_df.shape[1]
+        self.hap_df['index'] = np.arange(self.hap_df.shape[0])
+
+        self.phenotype_df = phenotype_df
+        self.phenotype_pos_df = phenotype_pos_df.copy()
+
         self.group_s = group_s
         self.window = window
+        self.require_both = require_both
 
+        # Validate & filter
         self._validate_data()
-        self._filter_phenotypes()
+        self._filter_phenotypes_by_genotypes()
+        self._filter_phenotypes_by_haplotypes()
+        self._drop_constant_phenotypes()
         self._calculate_cis_ranges()
 
+    # ----------------------------
+    # Validation & filtering
+    # ----------------------------
     def _validate_data(self):
-        assert (genotype_df.index == variant_df.index).all(), "Genotype and variant DataFrames must have the same index."
-        assert (phenotype_df.index == phenotype_df.index.unique()).all(), "Phenotype DataFrame index must be unique."
-        assert (loci_df.index == hap_df.index).all(), "Loci and haplotype DataFrames must have the same index."
+        # Index alignment
+        assert (self.genotype_df.index == self.variant_df.index).all(), \
+            "Genotype and variant DataFrames must share the same index order."
+        assert (self.hap_df.index == self.loci_df.index).all(), \
+            "Haplotype (hap_df) and loci_df must share the same index order."
+        # Phenotype index uniqueness
+        ph_index = self._to_pandas(self.phenotype_df).index
+        assert (ph_index == pd.Index(ph_index).unique()).all(), \
+            "Phenotype DataFrame index must be unique."
 
-    def _filter_phenotypes(self):
-        # Separate filtering for genotypes and haplotypes
-        self._filter_by_genotypes()
-        self._filter_by_haplotypes()
+    def _filter_phenotypes_by_genotypes(self):
+        variant_chrs = pd.Index(self.variant_df['chrom'].unique())
+        phenotype_chrs = pd.Index(self.phenotype_pos_df['chr'].unique())
+        keep_chrs = phenotype_chrs.intersection(variant_chrs)
+        m = self.phenotype_pos_df['chr'].isin(keep_chrs)
+        drop_n = int((~m).sum())
+        if drop_n:
+            print(f"    ** dropping {drop_n} phenotypes on chrs. without genotypes")
+        self.phenotype_df = self._loc_idx(self.phenotype_df, m)
+        self.phenotype_pos_df = self.phenotype_pos_df.loc[m]
 
-        # check for constant phenotypes and drop
-        m = np.all(self.phenotype_df.values == self.phenotype_df.values[:,[0]], 1)
-        if m.any():
-            print(f'    ** dropping {np.sum(m)} constant phenotypes')
-            self.phenotype_df = self.phenotype_df.loc[~m]
+    def _filter_phenotypes_by_haplotypes(self):
+        hap_chrs = pd.Index(self.hap_df['chrom'].unique())
+        phenotype_chrs = pd.Index(self.phenotype_pos_df['chr'].unique())
+        keep_chrs = phenotype_chrs.intersection(hap_chrs)
+        m = self.phenotype_pos_df['chr'].isin(keep_chrs)
+        drop_n = int((~m).sum())
+        if drop_n:
+            print(f"    ** dropping {drop_n} phenotypes on chrs. without haplotypes")
+        self.phenotype_df = self._loc_idx(self.phenotype_df, m)
+        self.phenotype_pos_df = self.phenotype_pos_df.loc[m]
+
+    def _drop_constant_phenotypes(self):
+        P = self._to_pandas(self.phenotype_df).values
+        # constant across samples
+        m = np.all(P == P[:, [0]], axis=1)
+        drop_n = int(m.sum())
+        if drop_n:
+            print(f"    ** dropping {drop_n} constant phenotypes")
+            self.phenotype_df = self._loc_idx(self.phenotype_df, ~m)
             self.phenotype_pos_df = self.phenotype_pos_df.loc[~m]
-
-        if len(self.phenotype_df) == 0:
+        if len(self._to_pandas(self.phenotype_df)) == 0:
             raise ValueError("No phenotypes remain after filters.")
 
-    def _filter_by_genotypes(self):
-        # drop phenotypes without genotypes on same contig
-        variant_chrs = self.variant_df['chrom'].unique()
-        phenotype_chrs = self.phenotype_pos_df['chr'].unique()
-        self.chrs = [i for i in phenotype_chrs if i in variant_chrs]
-        m = phenotype_pos_df['chr'].isin(self.chrs)
-        if any(~m):
-            print(f'    ** dropping {sum(~m)} phenotypes on chrs. without genotypes')
-        self.phenotype_df = phenotype_df[m]
-        self.phenotype_pos_df = phenotype_pos_df[m]
-
-    def _filter_by_haplotypes(self):
-        # drop phenotypes without haplotypes on same contig
-        hap_chrs = self.hap_df['chromosomes'].unique()
-        phenotype_chrs = self.phenotype_pos_df['chr'].unique()
-        self.chrs = [i for i in phenotype_chrs if i in hap_chrs]
-        m = phenotype_pos_df['chr'].isin(self.chrs)
-        if any(~m):
-            print(f'    ** dropping {sum(~m)} phenotypes on chrs. without haplotypes')
-        self.phenotype_df = phenotype_df[m]
-        self.phenotype_pos_df = phenotype_pos_df[m]
-
     def _calculate_cis_ranges(self):
-        # check phenotypes & calculate genotype ranges
-        # get genotype indexes corresponding to cis-window of each phenotype
-        self.chr_variant_dfs = {c:g[['pos', 'index']] for c,g in self.variant_df.groupby('chrom')}
-        self.cis_ranges, drop_ids = get_cis_ranges(self.phenotype_pos_df, self.chr_variant_dfs, self.window)
-        if len(drop_ids) > 0:
-            print(f"    ** dropping {len(drop_ids)} phenotypes without variants in cis-window")
-            self.phenotype_df = self.phenotype_df.drop(drop_ids)
+        # Build per-chrom position/index tables (sorted)
+        self.chr_variant_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
+                                for c, g in self.variant_df.groupby('chrom', sort=False)}
+        self.chr_haplotype_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
+                                  for c, g in self.hap_df.groupby('chrom', sort=False)}
+
+        self.cis_ranges, drop_ids = get_cis_ranges(
+            self.phenotype_pos_df,
+            self.chr_variant_dfs,
+            self.chr_haplotype_dfs,
+            self.window,
+            require_both=self.require_both,
+            verbose=True,
+        )
+        if drop_ids:
+            print(f"    ** dropping {len(drop_ids)} phenotypes without required windows")
+            self.phenotype_df = self._drop_by_ids(self.phenotype_df, drop_ids)
             self.phenotype_pos_df = self.phenotype_pos_df.drop(drop_ids)
-        if 'pos' in self.phenotype_pos_df:
+
+        # Cache counts
+        self.n_phenotypes = self._to_pandas(self.phenotype_df).shape[0]
+        if self.group_s is not None:
+            self.group_s = self.group_s.loc[self.phenotype_pos_df.index].copy()
+            self.n_groups = int(self.group_s.unique().shape[0])
+
+        # Phenotype start/end dicts
+        if 'pos' in self.phenotype_pos_df.columns:
             self.phenotype_start = self.phenotype_pos_df['pos'].to_dict()
             self.phenotype_end = self.phenotype_start
         else:
             self.phenotype_start = self.phenotype_pos_df['start'].to_dict()
             self.phenotype_end = self.phenotype_pos_df['end'].to_dict()
-        self.n_phenotypes = self.phenotype_df.shape[0]
 
-        if self.group_s is not None:
-            self.group_s = self.group_s.loc[self.phenotype_df.index].copy()
-            self.n_groups = self.group_s.unique().shape[0]
-
+    # ----------------------------
+    # Generation
+    # ----------------------------
     @background(max_prefetch=6)
-    def generate_data(self, chrom=None, verbose=False):
-        """
-        Generate batches from genotype data
+    def generate_data(
+        self, chrom: Optional[str] = None,
+        verbose: bool = False, as_cupy: bool = True,
+    ):
+        """Yield batches for cis mapping.
 
-        Returns: phenotype array, genotype matrix, genotype index, phenotype ID(s), [group ID]
+        Yields
+        ------
+        phenotype: 1D array (samples,)
+        variants:  2D array (n_variants_in_window x samples)
+        v_index:   1D array of variant row indices (global)
+        haplotypes:2D array (n_haps_in_window x samples)
+        h_index:   1D array of haplotype row indices (global)
+        phenotype_id: str or list[str] if grouped
+        [group_id]: optional, when grouped
         """
         if chrom is None:
-            phenotype_ids = self.phenotype_df.index
+            phenotype_ids = list(self.phenotype_pos_df.index)
             chr_offset = 0
         else:
-            phenotype_ids = self.phenotype_pos_df[self.phenotype_pos_df['chr'] == chrom].index
-            if self.group_s is None:
-                offset_dict = {i:j for i,j in zip(*np.unique(self.phenotype_pos_df['chr'], return_index=True))}
-            else:
-                offset_dict = {i:j for i,j in zip(*np.unique(self.phenotype_pos_df['chr'][self.group_s.drop_duplicates().index], return_index=True))}
-            chr_offset = offset_dict[chrom]
+            phenotype_ids = list(self.phenotype_pos_df[self.phenotype_pos_df['chr'] == chrom].index)
+            # compute offset for cosmetic progress (optional)
+            offset_dict = {c: i for i, c in enumerate(self.phenotype_pos_df['chr'].drop_duplicates())}
+            chr_offset = int(offset_dict.get(chrom, 0))
 
-        index_dict = {j:i for i,j in enumerate(self.phenotype_df.index)}
+        index_of = {pid: i for i, pid in enumerate(self.phenotype_df.index)}
 
         if self.group_s is None:
-            for k,phenotype_id in enumerate(phenotype_ids, chr_offset+1):
+            for k, pid in enumerate(phenotype_ids, chr_offset + 1):
                 if verbose:
-                    print_progress(k, self.n_phenotypes, 'phenotype')
-                p = self.phenotype_df.values[index_dict[phenotype_id]]
-                # p = self.phenotype_df.values[k]
-                r = self.cis_ranges[phenotype_id]
-                yield p, self.genotype_df.values[r[0]:r[-1]+1], np.arange(r[0],r[-1]+1), phenotype_id
+                    _print_progress(k, self.n_phenotypes, 'phenotype')
+
+                p = _row(self.phenotype_df, index_of[pid], as_cupy=as_cupy).ravel()
+                r = self.cis_ranges[pid]
+
+                # Variant slice
+                v_lb, v_ub = r['variants'] if r['variants'] is not None else (None, None)
+                if v_lb is not None:
+                    G = _row_slice(self.genotype_df, v_lb, v_ub + 1, as_cupy=as_cupy)
+                    G_idx = np.arange(v_lb, v_ub + 1)
+                else:
+                    G = None
+                    G_idx = np.arange(0, 0, dtype=int)
+
+                # Haplotype slice
+                h_lb, h_ub = r['haplotypes'] if r['haplotypes'] is not None else (None, None)
+                if h_lb is not None:
+                    H = _row_slice(self.loci_df, h_lb, h_ub + 1, as_cupy=as_cupy)
+                    H_idx = np.arange(h_lb, h_ub + 1)
+                else:
+                    H = None
+                    H_idx = np.arange(0, 0, dtype=int)
+
+                yield p, G, G_idx, H, H_idx, pid
         else:
-            gdf = self.group_s[phenotype_ids].groupby(self.group_s, sort=False)
-            for k,(group_id,g) in enumerate(gdf, chr_offset+1):
+            # Grouped mode: all phenotypes in group must share ranges or we take union
+            grouped = self.group_s.loc[phenotype_ids].groupby(self.group_s, sort=False)
+            for k, (group_id, g) in enumerate(grouped, chr_offset + 1):
                 if verbose:
-                    print_progress(k, self.n_groups, 'phenotype group')
-                # check that ranges are the same for all phenotypes within group
-                assert np.all([self.cis_ranges[g.index[0]][0] == self.cis_ranges[i][0] and self.cis_ranges[g.index[0]][1] == self.cis_ranges[i][1] for i in g.index[1:]])
-                group_phenotype_ids = g.index.tolist()
-                # p = self.phenotype_df.loc[group_phenotype_ids].values
-                p = self.phenotype_df.values[[index_dict[i] for i in group_phenotype_ids]]
-                r = self.cis_ranges[g.index[0]]
-                yield p, self.genotype_df.values[r[0]:r[-1]+1], np.arange(r[0],r[-1]+1), group_phenotype_ids, group_id
+                    _print_progress(k, self.n_groups, 'phenotype group')
+                ids = list(g.index)
+                idxs = [index_of[i] for i in ids]
+                p = _rows(self.phenotype_df, idxs, as_cupy=as_cupy)
+
+                # Validate identical ranges; if not, take union
+                ranges = [self.cis_ranges[i] for i in ids]
+                v_lbs = [r['variants'][0] for r in ranges if r['variants'] is not None]
+                v_ubs = [r['variants'][1] for r in ranges if r['variants'] is not None]
+                h_lbs = [r['haplotypes'][0] for r in ranges if r['haplotypes'] is not None]
+                h_ubs = [r['haplotypes'][1] for r in ranges if r['haplotypes'] is not None]
+
+                v_lb, v_ub = (min(v_lbs), max(v_ubs)) if len(v_lbs) else (None, None)
+                h_lb, h_ub = (min(h_lbs), max(h_ubs)) if len(h_lbs) else (None, None)
+
+                G = _row_slice(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None, as_cupy=as_cupy) if v_lb is not None else None
+                H = _row_slice(self.loci_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy) if h_lb is not None else None
+                G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
+                H_idx = np.arange(h_lb, h_ub + 1) if h_lb is not None else np.arange(0, 0, dtype=int)
+
+                yield p, G, G_idx, H, H_idx, ids, group_id
+
+    # ----------------------------
+    # Utilities
+    # ----------------------------
+    @staticmethod
+    def _to_pandas(df: Union[pd.DataFrame, cuDF]) -> pd.DataFrame:
+        return df.to_pandas() if isinstance(df, cuDF) else df
+
+    @staticmethod
+    def _loc_idx(df: Union[pd.DataFrame, cuDF], mask: Union[np.ndarray, pd.Series]) -> Union[pd.DataFrame, cuDF]:
+        if isinstance(df, cuDF):
+            return df.loc[cudf.from_pandas(pd.Series(mask)).to_pandas().to_numpy()]
+        return df.loc[mask]
+
+    @staticmethod
+    def _drop_by_ids(df: Union[pd.DataFrame, cuDF], ids: List[str]) -> Union[pd.DataFrame, cuDF]:
+        if isinstance(df, cuDF):
+            return df.drop(ids, errors='ignore')
+        return df.drop(index=ids, errors='ignore')
+
+
+# ------------------------------------------------------
+# Low-level row getters (avoid .values materialization)
+# ------------------------------------------------------
+def _row(df: Union[pd.DataFrame, cuDF], i: int, as_cupy: bool = True) -> ArrayLike:
+    if isinstance(df, cuDF):
+        arr = df.iloc[i]
+        return arr.to_cupy() if as_cupy else arr
+    # pandas
+    arr = df.iloc[i].to_numpy(copy=False)
+    return cp.asarray(arr) if as_cupy else arr
+
+
+def _rows(df: Union[pd.DataFrame, cuDF], idxs: List[int], as_cupy: bool = True) -> ArrayLike:
+    if isinstance(df, cuDF):
+        arr = df.iloc[idxs]
+        return arr.to_cupy() if as_cupy else arr
+    arr = df.iloc[idxs].to_numpy(copy=False)
+    return cp.asarray(arr) if as_cupy else arr
+
+
+def _row_slice(
+    df: Union[pd.DataFrame, cuDF], lb: Optional[int], ub: Optional[int], as_cupy: bool = True
+) -> Optional[ArrayLike]:
+    if lb is None:
+        return None
+    if isinstance(df, cuDF):
+        view = df.iloc[lb:ub]
+        return view.to_cupy() if as_cupy else view
+    view = df.iloc[lb:ub].to_numpy(copy=False)
+    return cp.asarray(view) if as_cupy else view
+
+
+# ----------------------------
+# Simple progress printer
+# ----------------------------
+def _print_progress(k: int, n: int, entity: str) -> None:
+    msg = f"\r    processing {entity} {k}/{n}"
+    if k == n:
+        msg += "\n"
+    sys.stdout.write(msg)
+    sys.stdout.flush()
