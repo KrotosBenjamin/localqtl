@@ -1,12 +1,11 @@
+import torch
+import subprocess
 import numpy as np
 import pandas as pd
-import torch
+import sys, os, glob
 import scipy.stats as stats
-import subprocess
-import sys
-import os
-import glob
 from datetime import datetime
+from py_qvalue import qvalue, pi0est
 
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
@@ -33,8 +32,9 @@ def calculate_qvalues(res_df, fdr=0.05, qvalue_lambda=None, logger=None):
     # calculate q-values
     if qvalue_lambda is not None:
         logger.write(f'  * Calculating q-values with lambda = {qvalue_lambda:.3f}')
-    qval, pi0 = rfunc.qvalue(res_df[pval_col], lambda_qvalue=qvalue_lambda)
+    qval_res = qvalue(res_df[pval_col], lambda_qvalue=qvalue_lambda)
 
+    qval, pi0 = qval_res["qvalues"], qval_res["pi0"]
     res_df['qval'] = qval
     logger.write(f'  * Proportion of significant phenotypes (1-pi0): {1-pi0:.2f}')
     logger.write(f"  * QTL phenotypes @ FDR {fdr:.2f}: {(res_df['qval'] <= fdr).sum()}")
@@ -52,11 +52,13 @@ def calculate_qvalues(res_df, fdr=0.05, qvalue_lambda=None, logger=None):
             else:
                 pthreshold = lb
             logger.write(f'  * min p-value threshold @ FDR {fdr}: {pthreshold:.6g}')
-            res_df['pval_nominal_threshold'] = stats.beta.ppf(pthreshold, res_df['beta_shape1'], res_df['beta_shape2'])
+            res_df['pval_nominal_threshold'] = stats.beta.ppf(
+                pthreshold, res_df['beta_shape1'], res_df['beta_shape2']
+            )
 
 
-def calculate_afc(assoc_df, counts_df, genotype_df, variant_df=None, covariates_df=None,
-                  select_covariates=True, group='gene_id',
+def calculate_afc(assoc_df, counts_df, genotype_df, variant_df=None,
+                  covariates_df=None, select_covariates=True, group='gene_id',
                   imputation='offset', count_threshold=0, verbose=True):
     """
     Calculate allelic fold-change (aFC) for variant-gene pairs
@@ -104,7 +106,8 @@ def calculate_afc(assoc_df, counts_df, genotype_df, variant_df=None, covariates_
         impute_mean(genotypes_t)
         try:
             b, b_se = mixqtl.trc(genotypes_t, counts_t, covariates_t=covariates_t,
-                                 select_covariates=select_covariates, count_threshold=count_threshold,
+                                 select_covariates=select_covariates,
+                                 count_threshold=count_threshold,
                                  imputation=imputation, mode='multi', return_af=False)
             gdf['afc'] = b.cpu().numpy() * np.log2(np.e)
             gdf['afc_se'] = b_se.cpu().numpy() * np.log2(np.e)
@@ -116,8 +119,9 @@ def calculate_afc(assoc_df, counts_df, genotype_df, variant_df=None, covariates_
     return afc_df
 
 
-def calculate_replication(res_df, genotypes, phenotype_df, covariates_df=None, paired_covariate_df=None,
-                          interaction_s=None, compute_pi1=False, lambda_qvalue=None, logp=False):
+def calculate_replication(res_df, genotypes, phenotype_df, covariates_df=None,
+                          paired_covariate_df=None, interaction_s=None,
+                          compute_pi1=False, lambda_qvalue=None, logp=False):
     """res_df: DataFrame with 'variant_id' column and phenotype IDs as index"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -190,8 +194,12 @@ def calculate_replication(res_df, genotypes, phenotype_df, covariates_df=None, p
         slope_se_t = (slope_t.abs().double() / tstat_t).float()
         pval = 2*stats.t.cdf(-np.abs(tstat_t.cpu()), dof)
 
-        rep_df = pd.DataFrame(np.c_[res_df.index, res_df['variant_id'], ma_samples_t.cpu(), ma_count_t.cpu(), af_t.cpu(), pval, slope_t.cpu(), slope_se_t.cpu()],
-                              columns=['phenotype_id', 'variant_id', 'ma_samples', 'ma_count', 'af', 'pval_nominal', 'slope', 'slope_se']).infer_objects()
+        rep_df = pd.DataFrame(np.c_[res_df.index, res_df['variant_id'],
+                                    ma_samples_t.cpu(), ma_count_t.cpu(),
+                                    af_t.cpu(), pval, slope_t.cpu(), slope_se_t.cpu()],
+                              columns=['phenotype_id', 'variant_id', 'ma_samples',
+                                       'ma_count', 'af', 'pval_nominal',
+                                       'slope', 'slope_se']).infer_objects()
 
     else:
         if paired_covariate_df is not None:
@@ -228,15 +236,20 @@ def calculate_replication(res_df, genotypes, phenotype_df, covariates_df=None, p
         b = b_t.cpu()
         b_se = b_se_t.cpu()
 
-        rep_df = pd.DataFrame(np.c_[res_df.index, res_df['variant_id'], ma_samples_t.cpu(), ma_count_t.cpu(), af_t.cpu(),
-                                    pval[:,0], b[:,0], b_se[:,0], pval[:,1], b[:,1], b_se[:,1], pval[:,2], b[:,2], b_se[:,2]],
-                              columns=['phenotype_id', 'variant_id', 'ma_samples', 'ma_count', 'af',
-                                       'pval_g', 'b_g', 'b_g_se', 'pval_i', 'b_i', 'b_i_se', 'pval_gi', 'b_gi', 'b_gi_se']).infer_objects()
+        rep_df = pd.DataFrame(np.c_[res_df.index, res_df['variant_id'],
+                                    ma_samples_t.cpu(), ma_count_t.cpu(), af_t.cpu(),
+                                    pval[:,0], b[:,0], b_se[:,0], pval[:,1],
+                                    b[:,1], b_se[:,1], pval[:,2], b[:,2], b_se[:,2]],
+                              columns=['phenotype_id', 'variant_id', 'ma_samples',
+                                       'ma_count', 'af', 'pval_g', 'b_g', 'b_g_se',
+                                       'pval_i', 'b_i', 'b_i_se', 'pval_gi',
+                                       'b_gi', 'b_gi_se']).infer_objects()
         pval = pval[:,2]
 
     if compute_pi1:
         try:
-            pi1 = 1 - rfunc.pi0est(pval, lambda_qvalue=lambda_qvalue)[0]
+            res = pi0est(pval, lambda_qvalue=lambda_qvalue)
+            pi1 = 1 - res["pi0"]
         except:
             pi1 = np.nan
         return pi1, rep_df
