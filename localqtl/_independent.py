@@ -8,13 +8,7 @@ from core import (
     calculate_cis_permutations,
     calculate_beta_approx_pval
 )
-from utils import (
-    _prepare_tensor,
-    _prepare_window,
-    _apply_maf_filters,
-    _filter_monomorphic,
-    _prepare_window_tensors
-)
+from utils import _prepare_tensor, _prepare_window
 
 def _forward_pass(
         phenotype_t, genotypes_t, haplotypes_t, permutation_ix_t,

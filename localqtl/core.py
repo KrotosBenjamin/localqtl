@@ -13,13 +13,13 @@ before passing into these functions. Ensure consistency of
 tensor types (torch.Tensor vs cupy/numpy arrays).
 """
 import torch
-import sys, re, subprocess
+import sys, re
 import numpy as np
 import pandas as pd
-import scipy.stats as stats
 import scipy.optimize
-from scipy.special import loggamma
 from time import strftime
+import scipy.stats as stats
+from scipy.special import loggamma
 from collections import OrderedDict
 
 from utils import _prepare_tensor
@@ -322,7 +322,7 @@ def prepare_cis_output(r_nominal, r2_perm, std_ratio, g, num_var, dof, variant_i
     tstat2 = dof * r2_nominal / (1 - r2_nominal)
     slope_se = np.abs(slope) / np.sqrt(tstat2)
 
-    n2 = 2*len(g)
+    n2 = 2 * len(g)
     af = np.sum(g) / n2
     if af <= 0.5:
         ma_samples = np.sum(g>0.5)
