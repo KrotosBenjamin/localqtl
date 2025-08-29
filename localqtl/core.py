@@ -20,7 +20,9 @@ import scipy.stats as stats
 import scipy.optimize
 from scipy.special import loggamma
 from time import strftime
+from collections import OrderedDict
 
+from utils import _prepare_tensor
 # ----------------------------
 # Output dtype specification
 # ----------------------------
@@ -225,6 +227,217 @@ def get_t_pval(t, df, log=False):
 # -----------------------------------------------------------------------------
 # Regression, filtering, and covariates
 # -----------------------------------------------------------------------------
+def calculate_association(genotype_df, phenotype_s, covariates_df=None,
+                          interaction_s=None, haplotype_df=None,
+                          maf_threshold_interaction=0.05,
+                          logp=False, window=1_000_000, verbose=True):
+    """
+    Standalone helper function for computing the association between
+    genotypes/haplotypes and a phenotype.
+
+    This does not work yet.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert genotype_df.columns.equals(phenotype_s.index)
+
+    # GPU tensors
+    phenotype_t = _prepare_tensor(phenotype_s.values, device=device)
+    genotypes_t = _prepare_tensor(genotype_df.values, device=device)
+    impute_mean(genotypes_t)
+
+    haplotypes_t = None
+    if haplotype_df is not None:
+        assert haplotype_df.columns.equals(phenotype_s.index)
+        haplotypes_t = _prepare_tensor(haplotype_df.values, device=device)
+
+    dof = phenotype_s.shape[0] - 2
+    residualizer = None
+    if covariates_df is not None:
+        assert phenotype_s.index.equals(covariates_df.index)
+        cov_t = _prepare_tensor(covariates_df.values, device=device)
+        residualizer = Residualizer(cov_t)
+        dof -= covariates_df.shape[1]
+
+    # Simple cis model
+    if interaction_s is None:
+        res = calculate_cis_nominal(genotypes_t, phenotype_t, residualizer,
+                                    haplotypes_t=haplotypes_t)
+        if len(res) == 6:
+            tstat, slope, slope_se, af, ma_samples, ma_count = [i.cpu().numpy() for i in res]
+            df = pd.DataFrame({
+                'pval_nominal': get_t_pval(tstat, dof, log=logp),
+                'slope': slope, 'slope_se': slope_se,
+                'tstat': tstat, 'af': af, 'ma_samples': ma_samples, 'ma_count': ma_count,
+            }, index=genotype_df.index)
+        else:
+            tstat, slope, slope_se = [i.cpu().numpy() for i in res]
+            df = pd.DataFrame({
+                'pval_nominal': get_t_pval(tstat, dof, log=logp),
+                'slope': slope, 'slope_se': slope_se,
+                'tstat': tstat,
+            }, index=genotype_df.index)
+    else:
+        interaction_t = _prepare_tensor(interaction_s.values.reshape(1, -1),
+                                        device=device)
+        if maf_threshold_interaction > 0:
+            mask_s = pd.Series(True, index=interaction_s.index)
+            mask_s[interaction_s.sort_values(kind='mergesort').index[:interaction_s.shape[0]//2]] = False
+            interaction_mask_t = torch.BoolTensor(mask_s.values).to(device)
+        else:
+            interaction_mask_t = None
+
+        genotypes_t, mask_t = filter_maf_interaction(genotypes_t, interaction_mask_t=interaction_mask_t,
+                                                     maf_threshold_interaction=maf_threshold_interaction)
+        res = calculate_interaction_nominal(genotypes_t, phenotype_t.unsqueeze(0),
+                                            interaction_t, residualizer,
+                                            haplotypes_t=haplotypes_t,
+                                            return_sparse=False)
+        tstat, b, b_se, af, ma_samples, ma_count = [i.cpu().numpy() for i in res]
+        mask = mask_t.cpu().numpy()
+        dof -= 2
+        df = pd.DataFrame({
+            'pval_g': get_t_pval(tstat[:,0], dof, log=logp),
+            'b_g': b[:,0], 'b_g_se': b_se[:,0],
+            'pval_i': get_t_pval(tstat[:,1], dof, log=logp),
+            'b_i': b[:,1], 'b_i_se': b_se[:,1],
+            'pval_gi': get_t_pval(tstat[:,2], dof, log=logp),
+            'b_gi': b[:,2], 'b_gi_se': b_se[:,2],
+            'af':af, 'ma_samples':ma_samples, 'ma_count':ma_count,
+        }, index=genotype_df.index[mask])
+
+    if df.index.str.startswith('chr').all():  # assume chr_pos_ref_alt_build format
+        df['position'] = df.index.map(lambda x: int(x.split('_')[1]))
+
+    return df
+
+
+def prepare_cis_output(r_nominal, r2_perm, std_ratio, g, num_var, dof, variant_id,
+                       start_distance, end_distance, phenotype_id, nperm=10_000,
+                       logp=False):
+    """Return nominal p-value, allele frequencies, etc. as pd.Series"""
+    r2_nominal = r_nominal * r_nominal
+    pval_perm = (np.sum(r2_perm >= r2_nominal) + 1) / (nperm + 1)
+
+    slope = r_nominal * std_ratio
+    tstat2 = dof * r2_nominal / (1 - r2_nominal)
+    slope_se = np.abs(slope) / np.sqrt(tstat2)
+
+    n2 = 2*len(g)
+    af = np.sum(g) / n2
+    if af <= 0.5:
+        ma_samples = np.sum(g>0.5)
+        ma_count = np.sum(g[g>0.5])
+    else:
+        ma_samples = np.sum(g<1.5)
+        ma_count = n2 - np.sum(g[g>0.5])
+
+    res_s = pd.Series(OrderedDict([
+        ('num_var', num_var),
+        ('beta_shape1', np.nan),
+        ('beta_shape2', np.nan),
+        ('true_df', np.nan),
+        ('pval_true_df', np.nan),
+        ('variant_id', variant_id),
+        ('start_distance', start_distance),
+        ('end_distance', end_distance),
+        ('ma_samples', ma_samples),
+        ('ma_count', ma_count),
+        ('af', af),
+        ('pval_nominal', pval_from_corr(r2_nominal, dof, logp=logp)),
+        ('slope', slope),
+        ('slope_se', slope_se),
+        ('pval_perm', pval_perm),
+        ('pval_beta', np.nan),
+    ]), name=phenotype_id)
+    return res_s
+
+
+def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
+                          haplotypes_t=None, return_af=True):
+    """
+    Compute nominal cis-association statistics.
+
+    genotypes_t: genotypes x samples
+    phenotype_t: single phenotype
+    residualizer: Residualizer object (see core.py)
+    haplotypes_t: haplotypes x samples
+    """
+    # Concatenate haplotypes if provided
+    if haplotypes_t is not None:
+        X_t = torch.cat([genotypes_t, haplotypes_t], dim=0)  # (variants+haplotypes) x samples
+    else:
+        X_t = genotypes_t
+
+    # Ensure phenotypes is 2D
+    p = phenotype_t.view(1, -1)
+
+    # Correlation and variance components
+    r_nominal_t, genotype_var_t, phenotype_var_t = calculate_corr(
+        X_t, p, residualizer=residualizer, return_var=True
+    )
+    r_nominal_t = r_nominal_t.squeeze()
+    r2_nominal_t = r_nominal_t.double().pow(2)
+
+    # Degrees of freedom
+    dof = residualizer.dof if residualizer is not None else p.shape[1] - 2
+
+    # Effect sizes
+    std_ratio_t = torch.sqrt(phenotype_var_t / genotype_var_t).squeeze()
+    slope_t = r_nominal_t * std_ratio_t
+    tstat_t = r_nominal_t * torch.sqrt(dof / (1 - r2_nominal_t))
+    slope_se_t = (slope_t.double() / tstat_t).float()
+
+    if not return_af:
+        return tstat_t, slope_t, slope_se_t
+
+    # Allele frequency stats for variants only
+    af_t, ma_samples_t, ma_count_t = get_allele_stats(genotypes_t)
+    return tstat_t, slope_t, slope_se_t, af_t, ma_samples_t, ma_count_t
+
+
+def calculate_cis_permutations(genotypes_t, phenotype_t, permutation_ix_t,
+                               residualizer=None, haplotypes_t=None,
+                               random_tiebreak=False, eps=1e-12):
+    """
+    Compute nominal correlation and empirical permutation-based correlations.
+    """
+    # Combine genotypes + haplotypes if both provided
+    if haplotypes_t is not None:
+        X_t = torch.cat([genotypes_t, haplotypes_t], dim=0)
+    else:
+        X_t = genotypes_t
+
+    # Generate permuted phenotypes
+    permutations_t = phenotype_t[permutation_ix_t]
+
+    # Nominal correlation
+    r_nominal_t, genotype_var_t, phenotype_var_t =  calculate_corr(
+        X_t, phenotype_t.view(1,-1), residualizer=residualizer, return_var=True
+    )
+    r_nominal_t = r_nominal_t.squeeze()
+    std_ratio_t = torch.sqrt(phenotype_var_t / genotype_var_t.clamp(min=eps)).squeeze()
+
+    # Permutation correlations
+    corr_t = calculate_corr(X_t, permutations_t, residualizer=residualizer).pow(2)
+    corr_t = corr_t[~torch.isnan(corr_t).any(1)]
+    if corr_t.shape[0] == 0:
+        raise ValueError('All correlations resulted in NaN. Please check phenotype values.')
+    r2_perm_t, _ = corr_t.max(0)
+
+    # Nominal r^2
+    r2_nominal_t = r_nominal_t.pow(2)
+    r2_nominal_t[torch.isnan(r2_nominal_t)] = -1  # Workaround for nanargmax()
+
+    # Select best row (variant or haplotype)
+    if random_tiebreak:
+        max_ix = torch.nonzero(r2_nominal_t == r2_nominal_t.max(), as_tuple=True)[0]
+        ix = max_ix[torch.randint(0, len(max_ix), (1,))[0]]
+    else:
+        ix = r2_nominal_t.argmax()
+
+    return r_nominal_t[ix], std_ratio_t[ix], ix, r2_perm_t, X_t[ix]
+
+
 def calculate_interaction_nominal(
         genotypes_t: torch.Tensor,
         phenotypes_t: torch.Tensor,
