@@ -14,7 +14,7 @@ import importlib.metadata
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
 from post import *
-import genotypeio, cis, trans, susie
+import haplotypeio, genotypeio, cis, trans, susie
 
 
 def main():

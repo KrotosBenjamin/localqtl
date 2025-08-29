@@ -1,2 +1,2 @@
-import tensorqtl
-tensorqtl.main()
+import localqtl
+localqtl.main()
