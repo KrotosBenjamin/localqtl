@@ -56,10 +56,10 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         None, mapping_state["logger"]
     )
 
-    igc = local.InputGeneratorCis(
+    igc = haplotypeio.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        loci_df if loci_df is not None else pd.DataFrame(index=[]),
         haplotype_df if haplotype_df is not None else pd.DataFrame(index=[]),
+        loci_df if loci_df is not None else pd.DataFrame(index=[]),
         group_s=group_s, window=window
     )
 
