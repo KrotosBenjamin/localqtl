@@ -12,6 +12,7 @@ import scipy.optimize
 from time import strftime
 import scipy.stats as stats
 from scipy.special import loggamma
+from typing import Optional, Tuple
 from collections import OrderedDict
 
 from helper import _prepare_tensor
