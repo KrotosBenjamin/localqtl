@@ -55,6 +55,7 @@ class RFMixReader:
         Chromosomes to exclude from imputed matrices.
     binary_path : str
         Path with prebuilt binary files (default: "./binary_files").
+    impute : bool
     verbose : bool
     dtype : cupy dtype
 
@@ -83,7 +84,7 @@ class RFMixReader:
         select_samples: Optional[List[str]] = None,
         exclude_chrs: Optional[List[str]] = None,
         binary_path: str = "./binary_files",
-        verbose: bool = True, dtype=cp.int8,
+        impute: bool = False, verbose: bool = True, dtype=cp.int8,
     ):
         self.zarr_dir = f"{prefix_path}"
         bin_dir = f"{binary_path}"
@@ -93,7 +94,7 @@ class RFMixReader:
         if admix.ndim != 3:
             n_vars, total = admix.shape
             n_pops = total // len(self.g_anc.sample_id.unique())
-            n_samp = total // n_pop
+            n_samp = total // n_pops
             admix = admix.reshape(n_vars, n_samp, n_pops)
         loci = loci.rename(columns={"chromosome": "chrom",
                                     "physical_position": "pos"})
@@ -112,7 +113,7 @@ class RFMixReader:
 
         # Drive imputation to build a complete ancestry grid aligned to variants
         zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
-        if not exists(zarr_file):
+        if (not exists(zarr_file) or impute:
             _ = interpolate_array(variant_loci, admix, self.zarr_dir)
         daz = from_zarr(zarr_file)  # (variants_aligned x samples x pops)
 
