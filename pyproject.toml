@@ -3,11 +3,11 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["tensorqtl"]
+packages = ["localqtl"]
 
 [project]
-name = "tensorqtl"
-version = "1.0.10"
+name = "localqtl"
+version = "0.1.0"
 dependencies = [
     "numpy",
     "pandas",
@@ -15,17 +15,20 @@ dependencies = [
     "qtl",
     "scipy",
     "torch",
+    "rfmix-reader"
 ]
 authors = [
-    {name = "Francois Aguet", email = "francois@broadinstitute.org"}
+    {name = "Francois Aguet", email = "francois@broadinstitute.org"},
+    {name = "Kynon J Benjamin", email = "kj.benjamin90@gmail.com"}
 ]
 maintainers = [
-    {name = "Francois Aguet", email = "francois@broadinstitute.org"}
+    {name = "Francois Aguet", email = "francois@broadinstitute.org"},
+    {name = "Kynon J Benjamin", email = "kj.benjamin90@gmail.com}"}
 ]
-description = "GPU-accelerated QTL mapper"
+description = "Local Ancestry GPU-accelerated QTL mapper"
 readme = "README.md"
 license = {file = "LICENSE"}
-keywords = ["Quantitative trait loci"]
+keywords = ["Quantitative trait loci", "Local ancestry"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -34,4 +37,4 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/broadinstitute/tensorqtl.git"
+Repository = "https://github.com/KrotosBenjamin/localqtl.git"
