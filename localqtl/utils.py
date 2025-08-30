@@ -255,12 +255,15 @@ def _count_pairs_for_chromosome(igc, chrom, group_s):
     """Count number of phenotype-variant pairs for allocation."""
     n = 0
     if group_s is None:
-        for pid in igc.phenotype_pos_df[igc.phenotype_pos_df['chr'] == chrom].index:
-            start, end = igc.cis_ranges[pid]
-            n += end - start + 1
+        pids = igc.phenotype_pos_df[igc.phenotype_pos_df['chr'] == chrom].index
     else:
-        for pid in igc.group_s[igc.phenotype_pos_df['chr'] == chrom].drop_duplicates().index:
-            start, end = igc.cis_ranges[pid]
+        pids = igc.group_s[igc.phenotype_pos_df['chr'] == chrom].drop_duplicates().index
+    
+    for pid in pids:
+        ## Might want to change igc.cis_ranges from dict to variant only
+        r = igc.cis_ranges[pid]
+        if r["variants"] is not None:
+            start, end = r["variants"]
             n += end - start + 1
     return n
 
