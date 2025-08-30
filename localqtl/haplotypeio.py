@@ -329,6 +329,8 @@ class InputGeneratorCis:
         self.phenotype_df = phenotype_df
         self.phenotype_pos_df = phenotype_pos_df.copy()
 
+        self.n_samples = self._to_pandas(self.phenotype_df).shape[1]
+
         self.group_s = group_s
         self.window = window
         self.require_both = require_both
@@ -336,7 +338,8 @@ class InputGeneratorCis:
         # Validate & filter
         self._validate_data()
         self._filter_phenotypes_by_genotypes()
-        self._filter_phenotypes_by_haplotypes()
+        if self.require_both:
+            self._filter_phenotypes_by_haplotypes()
         self._drop_constant_phenotypes()
         self._calculate_cis_ranges()
 
@@ -381,6 +384,7 @@ class InputGeneratorCis:
             print(f"    ** dropping {drop_n} phenotypes on chrs. without genotypes")
         self.phenotype_df = self._loc_idx(self.phenotype_df, m)
         self.phenotype_pos_df = self.phenotype_pos_df.loc[m]
+        self.chrs = list(keep_chrs)
 
     def _filter_phenotypes_by_haplotypes(self):
         hap_chrs = pd.Index(self.hap_df['chrom'].unique())
