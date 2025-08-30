@@ -12,7 +12,7 @@ Notes
 - Avoids materialization; uses dask-backed arrays and cuDF slicing.
 - Compatible with original tensorQTL patterns while adding local ancestry.
 
-Author: Kynon J Benjamin (refactor by assistant per user request)
+Author: Kynon J Benjamin
 """
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ class RFMixReader:
         Subset of sample IDs to keep (order preserved).
     exclude_chrs : list[str], optional
         Chromosomes to exclude from imputed matrices.
-    binary_dir_name : str
-        Directory name with prebuilt binary files (default: "binary_files").
+    binary_path : str
+        Path with prebuilt binary files (default: "./binary_files").
     verbose : bool
     dtype : cupy dtype
 
@@ -81,11 +81,11 @@ class RFMixReader:
         self, prefix_path: str, variant_df: pd.DataFrame,
         select_samples: Optional[List[str]] = None,
         exclude_chrs: Optional[List[str]] = None,
-        binary_dir_name: str = "binary_files",
+        binary_path: str = "./binary_files",
         verbose: bool = True, dtype=cp.int8,
     ):
         self.zarr_dir = f"{prefix_path}"
-        bin_dir = f"{prefix_path}/{binary_dir_name}"
+        bin_dir = f"{binary_path}"
 
         loci, self.g_anc, admix = read_rfmix(prefix_path, binary_dir=bin_dir,
                                              verbose=verbose)
