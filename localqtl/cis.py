@@ -12,11 +12,7 @@ from utils import (
     _write_chromosome_results,
     _summarize_top_associations
 )
-from _nominal import (
-    _map_chromosome,
-    _process_phenotype_window,
-    _process_grouped_phenotype_window
-)
+from _nominal import _map_chromosome
 from _permutation import (
     _make_permutation_index,
     _process_permutation_window,

@@ -276,7 +276,7 @@ def _merge_results(chr_res, chr_block, start, n_i):
 
 def _prepare_window(row, genotype_ix_t, variant_df, igc, maf_threshold,
                     interaction_df=None, maf_threshold_interaction=0,
-                    device=device, logger=logger, warn_monomorphic=True,
+                    device=None, logger=None, warn_monomorphic=True,
                     is_group=False, is_perm=False):
     if not is_group:
         phenotype, genotypes, g_idx, haplotypes, _, phenotype_id = row
