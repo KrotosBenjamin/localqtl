@@ -4,7 +4,7 @@ import pandas as pd
 import sys, os, time
 
 sys.path.insert(1, os.path.dirname(__file__))
-import local
+import haplotypeio
 from utils import (
     _init_result_dict,
     _log_mapping_context,
