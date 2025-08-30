@@ -5,6 +5,7 @@ import pandas as pd
 from collections import OrderedDict
 
 import eigenmt
+from helper import _prepare_tensor
 from core import (
     get_t_pval,
     impute_mean,
@@ -13,10 +14,6 @@ from core import (
     calculate_maf,
     filter_maf_interaction
 )
-
-def _prepare_tensor(df, dtype=torch.float32, device='cpu'):
-    return torch.tensor(df, dtype=dtype).to(device)
-
 
 def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device):
     """Prepare genotype/haplotype tensors and impute missing."""

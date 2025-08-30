@@ -3,14 +3,6 @@ GPU-accelerated association mapping core utilities.
 Provides residualization, allele frequency utilities,
 correlation/regression functions, beta approximation
 for permutation p-values, and I/O helpers.
-
-Integration Note:
------------------
-When using the new `InputGeneratorCis`, genotypes (variants)
-and haplotypes (local ancestry tracks) may be provided as
-CuPy arrays or Dask arrays that are `.compute()`d into CuPy
-before passing into these functions. Ensure consistency of
-tensor types (torch.Tensor vs cupy/numpy arrays).
 """
 import torch
 import sys, re
@@ -22,7 +14,7 @@ import scipy.stats as stats
 from scipy.special import loggamma
 from collections import OrderedDict
 
-from utils import _prepare_tensor
+from helper import _prepare_tensor
 # ----------------------------
 # Output dtype specification
 # ----------------------------
