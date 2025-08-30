@@ -22,6 +22,7 @@ from __future__ import annotations
 import bisect, sys
 import numpy as np
 import pandas as pd
+from os.path import exists
 from typing import Dict, List, Optional, Tuple, Union
 
 import cudf
@@ -105,8 +106,10 @@ class RFMixReader:
         )
 
         # Drive imputation to build a complete ancestry grid aligned to variants
-        _ = interpolate_array(variant_loci, admix, self.zarr_dir)
-        daz = from_zarr(f"{self.zarr_dir}/local-ancestry.zarr")  # (variants_aligned x samples x pops)
+        zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
+        if not exists(zarr_file):
+            _ = interpolate_array(variant_loci, admix, self.zarr_dir)
+        daz = from_zarr(zarr_file)  # (variants_aligned x samples x pops)
 
         # Indices present in original loci (not right_only) to map back
         present_mask = ~(variant_loci["_merge"] == "right_only")
