@@ -1,2 +1,2 @@
-import localqtl
-localqtl.main()
+import cli
+cli.main()
