@@ -13,6 +13,7 @@ import importlib.metadata
 
 sys.path.insert(1, os.path.dirname(__file__))
 from core import *
+from utils import *
 from post import *
 import haplotypeio, genotypeio, cis, trans, susie
 
