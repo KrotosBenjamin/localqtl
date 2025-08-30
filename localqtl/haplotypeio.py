@@ -113,7 +113,7 @@ class RFMixReader:
 
         # Drive imputation to build a complete ancestry grid aligned to variants
         zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
-        if (not exists(zarr_file) or impute:
+        if (not exists(zarr_file)) or impute:
             _ = interpolate_array(variant_loci, admix, self.zarr_dir)
         daz = from_zarr(zarr_file)  # (variants_aligned x samples x pops)
 
