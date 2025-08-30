@@ -90,6 +90,11 @@ class RFMixReader:
 
         loci, self.g_anc, admix = read_rfmix(prefix_path, binary_dir=bin_dir,
                                              verbose=verbose)
+        if admix.ndim != 3:
+            n_vars, total = admix.shape
+            n_pops = total // len(self.g_anc.sample_id.unique())
+            n_samp = total // n_pop
+            admix = admix.reshape(n_vars, n_samp, n_pops)
         loci = loci.rename(columns={"chromosome": "chrom",
                                     "physical_position": "pos"})
 
