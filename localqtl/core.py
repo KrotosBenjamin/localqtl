@@ -347,7 +347,7 @@ def prepare_cis_output(r_nominal, r2_perm, std_ratio, g, num_var, dof, variant_i
 
 
 def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
-                          haplotypes_t=None, return_af=True, chunk_size=1_000_000):
+                          haplotypes_t=None, return_af=True, chunk_size=100_000):
     """
     Compute nominal cis-association statistics: Y ~ G + H + covariates,
     using chunked memory-efficient processing.
