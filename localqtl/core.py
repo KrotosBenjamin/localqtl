@@ -97,22 +97,26 @@ class Residualizer(object):
     """
     def __init__(self, C_t: torch.Tensor):
         # Center and orthogonalize covariates
-        self.Q_t, _ = torch.linalg.qr(C_t - C_t.mean(0))
+        C_t = C_t - C_t.mean(0)
+        self.Q_t, _ = torch.linalg.qr(C_t, mode='reduced')
         self.dof = C_t.shape[0] - 2 - C_t.shape[1]
 
     def transform(self, M_t: torch.Tensor, center: bool=True) -> torch.Tensor:
         """Residualize rows of M wrt columns of C"""
-        M0_t = M_t - M_t.mean(1, keepdim=True)
         if center:
-            return M0_t - torch.mm(torch.mm(M0_t, self.Q_t), self.Q_t.t())
-        else:
-            return M_t - torch.mm(torch.mm(M0_t, self.Q_t), self.Q_t.t())
+            M_t = M_t - M_t.mean(dim=1, keepdim=True)
+        return M_t - torch.mm(torch.mm(M_t, self.Q_t), self.Q_t.T)
 
 
 def center_normalize(M_t: torch.Tensor, dim: int=0) -> torch.Tensor:
-    """Center and normalize matrix (M) along given dimension"""
-    N_t = M_t - M_t.mean(dim=dim, keepdim=True)
-    return N_t / torch.sqrt(torch.pow(N_t, 2).sum(dim=dim, keepdim=True))
+    """
+    Subtract mean and divide by L2 norm along specified dim.
+    Returns normalized tensor (same shape).
+    """
+    mean = M_t.mean(dim=dim, keepdim=True)
+    centered = M_t - mean
+    norm = torch.norm(centered, p=2, dim=dim, keepdim=True).clamp(min=1e-8)
+    return centered / norm.clamp(min=1e-8)
 
 
 # -----------------------------------------------------------------------------
@@ -179,29 +183,26 @@ def impute_mean(genotypes_t, missing=-9):
 # -----------------------------------------------------------------------------
 # Association testing utilities
 # -----------------------------------------------------------------------------
-def calculate_corr(genotype_t, phenotype_t, residualizer=None, return_var=False):
+def calculate_corr(X_t, Y_t, residualizer=None, return_var=False):
     """Calculate correlation between normalized residual genotypes and phenotypes"""
     if residualizer is not None:
-        genotype_res_t = residualizer.transform(genotype_t)  # variants x samples
-        phenotype_res_t = residualizer.transform(phenotype_t)  # phenotypes x samples
-    else:
-        genotype_res_t = genotype_t
-        phenotype_res_t = phenotype_t
+        X_t = residualizer.transform(X_t)  # variants x samples
+        Y_t = residualizer.transform(Y_t)  # phenotypes x samples
 
     if return_var:
-        genotype_var_t = genotype_res_t.var(1)
-        phenotype_var_t = phenotype_res_t.var(1)
+        X_var_t = torch.var(X_t, dim=1, unbiased=False)
+        Y_var_t = torch.var(Y_t, dim=1, unbiased=False)
 
     # Center and normalize
-    genotype_res_t = center_normalize(genotype_res_t, dim=1)
-    phenotype_res_t = center_normalize(phenotype_res_t, dim=1)
+    X_t = center_normalize(X_t, dim=1)
+    Y_t = center_normalize(Y_t, dim=1)
 
     # Correlation
-    cor_t = torch.mm(genotype_res_t, phenotype_res_t.t())
+    cor_t = torch.matmul(X_t, Y_t.T)
     if return_var:
-        return cor_t, genotype_var_t, phenotype_var_t
+        return cor_t.squeeze(1), X_var_t, Y_var_t
     else:
-        return cor_t
+        return cor_t.squeeze(1)
 
 
 def get_t_pval(t, df, log=False):
@@ -346,39 +347,80 @@ def prepare_cis_output(r_nominal, r2_perm, std_ratio, g, num_var, dof, variant_i
 
 
 def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
-                          haplotypes_t=None, return_af=True):
+                          haplotypes_t=None, return_af=True, chunk_size=1_000_000):
     """
-    Compute nominal cis-association statistics.
+    Compute nominal cis-association statistics: Y ~ G + H + covariates,
+    using chunked memory-efficient processing.
 
-    genotypes_t: genotypes x samples
-    phenotype_t: single phenotype
-    residualizer: Residualizer object (see core.py)
-    haplotypes_t: haplotypes x samples
+    Parameters:
+    -----------
+    genotypes_t: torch.Tensor
+        (num_variants x num_samples)
+    phenotype_t: torch.Tensor
+        (num_samples,) or (1 x num_samples)
+    residualizer: Residualizer
+        Covariate regressor object
+    haplotypes_t: torch.Tensor or None
+        (num_haplotypes x num_samples), optional
+    return_af: bool
+        Whether to return allele frequency stats for genotypes
+    chunk_size: int
+        Number of rows per chunk in joint [G; H] matrix
+
+    Returns:
+    --------
+    tstat_t: tensor
+    slope_t: tensor
+    slope_se_t: tensor
+    (optional) af_t, ma_samples_t, ma_count_t
     """
-    # Concatenate haplotypes if provided
-    if haplotypes_t is not None:
-        X_t = torch.cat([genotypes_t, haplotypes_t], dim=0)  # (variants+haplotypes) x samples
-    else:
-        X_t = genotypes_t
+    # Ensure phenotypes is 2D and float32
+    phenotype_t = phenotype_t.view(1, -1).float()
 
-    # Ensure phenotypes is 2D
-    p = phenotype_t.view(1, -1)
+    # Adjust chunk size if no haplotype data (normal behavior)
+    if haplotypes_t is None:
+        chunk_size = genotype_t.shape[0]
 
-    # Correlation and variance components
-    r_nominal_t, genotype_var_t, phenotype_var_t = calculate_corr(
-        X_t, p, residualizer=residualizer, return_var=True
-    )
-    r_nominal_t = r_nominal_t.squeeze()
-    r2_nominal_t = r_nominal_t.double().pow(2)
+    # Determine total rows and chunking
+    G_chunks = torch.split(genotypes_t, chunk_size)
+    H_chunks = torch.split(haplotypes_t, chunk_size) if haplotypes_t is not None else [None] * len(G_chunks)
+
+    r_chunks = []
+    gvar_chunks = []
+
+    for i in range(len(G_chunks)):
+        g_chunk = G_chunks[i]
+        h_chunk = H_chunks[i]
+
+        # Concatenate genotype and haplotype chunk
+        X_chunk = torch.cat([g_chunk, h_chunk], dim=0) if h_chunk is not None else g_chunk
+
+        # Correlation and variance components
+        r, g_var, p_var = calculate_corr(X_chunk, phenotype_t,
+                                         residualizer=residualizer,
+                                         return_var=True)
+        r_chunks.append(r)
+        gvar_chunks.append(g_var)
+
+        # Free memory early
+        del X_chunk, g_chunk, h_chunk
+        torch.cuda.empty_cache()
+
+    # Combine chunks
+    r_nominal_t = torch.cat(r_chunks, dim=0)
+    genotype_var_t = torch.cat(gvar_chunks, dim=0)
+    phenotype_var_t = p_var # same across all chunks
 
     # Degrees of freedom
     dof = residualizer.dof if residualizer is not None else p.shape[1] - 2
+    dof = float(dof)
 
-    # Effect sizes
-    std_ratio_t = torch.sqrt(phenotype_var_t / genotype_var_t).squeeze()
+    # Association statistics
+    r2_t = r_nominal_t ** 2
+    std_ratio_t = torch.sqrt(phenotype_var_t / genotype_var_t).clamp(min=1e-8)
     slope_t = r_nominal_t * std_ratio_t
-    tstat_t = r_nominal_t * torch.sqrt(dof / (1 - r2_nominal_t))
-    slope_se_t = (slope_t.double() / tstat_t).float()
+    tstat_t = r_nominal_t * torch.sqrt(dof / (1.0 - r2_t).clamp(min=1e-8))
+    slope_se_t = slope_t / tstat_t.clamp(min=1e-8)
 
     if not return_af:
         return tstat_t, slope_t, slope_se_t

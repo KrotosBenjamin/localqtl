@@ -87,6 +87,10 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
             best_assoc.append(top_hit)
         start += n_i
 
+        del row, results, chr_block
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
     logger.write(f'    time elapsed: {(time.time()-start_time)/60:.2f} min')
 
     # Clip any unused preallocated array space
@@ -113,12 +117,11 @@ def _process_phenotype_window(
     phenotypes, genotypes, g_idx, haplotypes, _, phenotype_ids = row
 
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
-    start_dist = variant_df['pos'].values[g_idx[0]:g_idx[-1] + 1] - \
-                 igc.phenotype_start[phenotype_id]
+    variant_pos = variant_df['pos'].to_numpy(copy=False)
+    start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_id]
     end_dist = None
     if 'pos' not in phenotype_pos_df:
-        end_dist = variant_df['pos'].values[g_idx[0]:g_idx[-1] + 1] - \
-                   igc.phenotype_end[phenotype_id]
+        end_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_end[phenotype_id]
 
     genotypes_t, haplotypes_t = _prepare_window_tensors(genotypes, haplotypes,
                                                         genotype_ix_t, device)
@@ -206,12 +209,11 @@ def _process_grouped_phenotype_window(
     """
     phenotypes, genotypes, g_idx, haplotypes, _, phenotype_ids, group_id = row
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
-    start_dist = variant_df['pos'].values[g_idx[0]:g_idx[-1] + 1] - \
-                 igc.phenotype_start[phenotype_ids[0]]
+    variant_pos = variant_df['pos'].to_numpy(copy=False)
+    start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_ids[0]]
     end_dist = None
     if 'pos' not in phenotype_pos_df:
-        end_dist = variant_df['pos'].values[g_idx[0]:g_idx[-1] + 1] - \
-                   igc.phenotype_end[phenotype_ids[0]]
+        end_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_end[phenotype_ids[0]]
 
     genotypes_t, haplotypes_t = _prepare_window_tensors(genotypes, haplotypes,
                                                         genotype_ix_t, device)

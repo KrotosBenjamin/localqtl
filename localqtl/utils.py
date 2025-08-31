@@ -78,10 +78,11 @@ def _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist, end_d
         if mask_t.sum() == 0:
             return None
         genotypes_t = genotypes_t[mask_t]
-        variant_ids = variant_ids[mask_t.cpu().numpy()]
-        start_dist = start_dist[mask_t.cpu().numpy()]
+        mask = mask_t.cpu().numpy().astype(bool)
+        variant_ids = variant_ids[mask]
+        start_dist = start_dist[mask]
         if end_dist is not None:
-            end_dist = end_dist[mask_t.cpu().numpy()]
+            end_dist = end_dist[mask]
         if haplotypes_t is not None:
             haplotypes_t = haplotypes_t[mask_t]
 
@@ -258,7 +259,7 @@ def _count_pairs_for_chromosome(igc, chrom, group_s):
         pids = igc.phenotype_pos_df[igc.phenotype_pos_df['chr'] == chrom].index
     else:
         pids = igc.group_s[igc.phenotype_pos_df['chr'] == chrom].drop_duplicates().index
-    
+
     for pid in pids:
         ## Might want to change igc.cis_ranges from dict to variant only
         r = igc.cis_ranges[pid]
