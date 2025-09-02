@@ -58,6 +58,8 @@ class RFMixReader:
     impute : bool
     verbose : bool
     dtype : cupy dtype
+    target_mb : int
+        Approximate target chunk size (MB) for rechunking.
 
     Attributes
     ----------
@@ -69,14 +71,10 @@ class RFMixReader:
         Sample metadata table from RFMix (contains 'sample_id', 'chrom').
     sample_ids : list[str]
     n_pops : int
-    loci_df : dask.array.Array
-        Ancestry dosage aligned to hap_df (n_hap_tracks x samples).
-        For n_pops==2, this is (variants x samples) using ancestry 0 to avoid colinearity.
-        For n_pops>2, this is (variants*ancestries x samples) with ancestry-aware hap IDs.
-    hap_df : pd.DataFrame
-        Mapping hap_id -> (chrom, pos, index[, ancestries]) for fast lookups.
-    hap_dfs : dict[str, pd.DataFrame]
-        Per-chrom position/index tables for windowing.
+    loci_df : pd.DataFrame
+        Ancestry dosage aligned to hap_df.
+    haplotypes : dask.array
+        Haplotype-level ancestry matrix (variants x samples [x ancestries]).
     """
 
     def __init__(
@@ -85,6 +83,7 @@ class RFMixReader:
         exclude_chrs: Optional[List[str]] = None,
         binary_path: str = "./binary_files",
         impute: bool = False, verbose: bool = True, dtype=cp.int8,
+        target_mb: int = 256,
     ):
         self.zarr_dir = f"{prefix_path}"
         bin_dir = f"{binary_path}"
@@ -99,25 +98,23 @@ class RFMixReader:
         loci = loci.rename(columns={"chromosome": "chrom",
                                     "physical_position": "pos"})
 
-        # Ensure unique variant positions for merge/alignment
+        # Ensure unique variant positions
         variant_df = variant_df.drop_duplicates(subset=["chrom", "pos"],
                                                 keep="first").copy()
 
-        # Align variant grid with available loci (allow imputation for missing)
-        # Merge retains full variant grid; keep indices for direct selection
+        # Align variant grid
         variant_loci = (
             variant_df.merge(_to_pandas(loci), on=["chrom", "pos"], how="outer",
                              indicator=True)
             .loc[:, ["chrom", "pos", "i", "_merge"]]
         )
 
-        # Drive imputation to build a complete ancestry grid aligned to variants
+        # Impute and load zarr
         zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
         if (not exists(zarr_file)) or impute:
             _ = interpolate_array(variant_loci, admix, self.zarr_dir)
         daz = from_zarr(zarr_file)  # (variants_aligned x samples x pops)
 
-        # Indices present in original loci (not right_only) to map back
         present_mask = ~(variant_loci["_merge"] == "right_only")
         idx_arr = from_array(variant_loci.index.values[present_mask.values])
         self.admix = daz[idx_arr]  # shape (variants, samples, ancestries)
@@ -135,7 +132,7 @@ class RFMixReader:
         self.loci["i"] = cudf.Series(range(len(self.loci)))
         self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
 
-        # Use all samples by default; allow subsetting
+        # Subset samples
         self.sample_ids = _get_sample_ids(self.g_anc)
         if select_samples is not None:
             ix = [self.sample_ids.index(i) for i in select_samples]
@@ -157,40 +154,70 @@ class RFMixReader:
         # Dimensions
         self.n_samples = int(self.admix.shape[1])
         self.n_pops = int(self.admix.shape[2])
+        self.variant_ids = variant_df.index.to_numpy()
 
-        # Build hap tables + loci_df view aligned to hap order
+        # Rechunk for efficiency
+        self.admix = self._efficient_rechunk(
+            self.admix, target_mb=target_mb, align_chunks=(None, 200, self.n_pops)
+        )
+        
+        # Build hap tables
         if self.n_pops == 2:
-            # Take first ancestry to avoid colinearity (A0 + A1 = 2)
-            A0 = self.admix[:, :, 0]  # dask (variants x samples)
-            hap_ids = (self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str) + "_A0")
-            hap_df = self.loci.to_pandas()[["chrom", "pos"]].copy()
-            hap_df["ancestry"] = 0
-            hap_df["hap"] = _to_pandas(hap_ids)
-            hap_df["index"] = np.arange(hap_df.shape[0])
-            self.hap_df = hap_df.set_index("hap")
-            self.hap_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.hap_df.reset_index().groupby("chrom", sort=False)}
-            self.loci_df = A0  # keep as dask array
-        else:
-            # >2 ancestries, build separate hap_df per ancestry
-            new_shape = (self.admix.shape[0] * self.admix.shape[2], self.admix.shape[1])
-            loci_flat = self.admix.reshape(new_shape)  # dask reshape (no compute)
-
-            hap_dfs = []
+            A0 = self.admix[:, :, [0]]
+            loci_ids = (self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str) + "_A0")
+            loci_df = self.loci.to_pandas()[["chrom", "pos"]].copy()
+            loci_df["ancestry"] = 0
+            loci_df["hap"] = _to_pandas(loci_ids)
+            loci_df["index"] = np.arange(loci_df.shape[0])
+            self.loci_df = loci_df.set_index("hap")
+            self.loci_dfs = {c: g[["pos", "index"]].sort_values("pos").reset_index(drop=True)
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+            self.haplotypes = A0
+        else: # >2 ancestries
+            loci_dfs = []
             for anc in range(self.n_pops):
-                hap_df_anc = self.loci.to_pandas()[["chrom", "pos"]].copy()
-                hap_df_anc["ancestry"] = anc
-                hap_df_anc["hap"] = (
-                    hap_df_anc["chrom"].astype(str) + "_" + hap_df_anc["pos"].astype(str) + f"_A{anc}"
+                loci_df_anc = self.loci.to_pandas()[["chrom", "pos"]].copy()
+                loci_df_anc["ancestry"] = anc
+                loci_df_anc["hap"] = (
+                    loci_df_anc["chrom"].astype(str) + "_" + loci_df_anc["pos"].astype(str) + f"_A{anc}"
                 )
                 # Global index along flattened (variants*ancestries) axis
-                hap_df_anc["index"] = np.arange(hap_df_anc.shape[0]) + anc * self.loci.shape[0]
-                hap_dfs.append(hap_df_anc)
+                loci_df_anc["index"] = np.arange(loci_df_anc.shape[0]) + anc * self.loci.shape[0]
+                loci_dfs.append(loci_df_anc)
 
-            self.hap_df = pd.concat(hap_dfs).set_index("hap")
-            self.hap_dfs = {c: g[["pos", "index", "ancestry"]].sort_values("pos").reset_index(drop=True)
-                            for c, g in self.hap_df.reset_index().groupby("chrom", sort=False)}
-            self.loci_df = loci_flat  # dask array
+            self.loci_df = pd.concat(loci_dfs).set_index("hap")
+            self.loci_dfs = {c: g[["pos", "index", "ancestry"]].sort_values("pos").reset_index(drop=True)
+                            for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
+            self.haplotypes = self.admix  # dask array
+
+    def _efficient_rechunk(self, arr: da.Array, target_mb: int = 256,
+                           align_chunks: tuple | None = None, balance: bool = True) -> da.Array:
+        """Rechunk array into memory-efficient blocks."""
+        dtype_size = arr.dtype.itemsize
+        shape = arr.shape
+        n_axes = arr.ndim
+        target_bytes = target_mb * 1024**2
+
+        new_chunks = list(arr.chunksize)
+
+        for ax in range(n_axes):
+            if align_chunks is not None and align_chunks[ax] is not None:
+                new_chunks[ax] = align_chunks[ax]
+                continue
+
+            per_unit = np.prod([shape[d] if d != ax else 1 for d in range(n_axes)])
+            per_unit_bytes = per_unit * dtype_size
+
+            if per_unit_bytes < target_bytes:
+                max_len = target_bytes // per_unit_bytes
+                new_chunks[ax] = min(shape[ax], int(max_len))
+            else:
+                new_chunks[ax] = shape[ax]
+
+        return arr.rechunk(tuple(new_chunks), balance=balance)
+
+    def load_haplotypes(self) -> np.array:
+        return np.asarray(self.haplotypes.compute())
 
 
 # ----------------------------
@@ -213,8 +240,7 @@ def get_cis_ranges(
     phenotype_pos_df: pd.DataFrame,
     chr_variant_dfs: Dict[str, pd.DataFrame],
     chr_haplotype_dfs: Dict[str, pd.DataFrame],
-    window: int, require_both: bool = True, verbose: bool = True,
-) -> Tuple[Dict[str, Dict[str, Tuple[int, int]]], List[str]]:
+    window: int, require_both: bool = True, verbose: bool = True):
     """Compute per-phenotype cis index ranges for variants and haplotypes.
 
     Returns
@@ -234,15 +260,8 @@ def get_cis_ranges(
     # Ensure dict-of-records for speed
     phenotype_pos_dict = pp.to_dict(orient='index')
 
-    cis_ranges: Dict[str, Dict[str, Tuple[int, int]]] = {}
-    drop_ids: List[str] = []
-
-    # Pre-extract numpy arrays for bisect per chromosome
-    var_pos = {c: df['pos'].to_numpy() for c, df in chr_variant_dfs.items()}
-    var_idx = {c: df['index'].to_numpy() for c, df in chr_variant_dfs.items()}
-    hap_pos = {c: df['pos'].to_numpy() for c, df in chr_haplotype_dfs.items()}
-    hap_idx = {c: df['index'].to_numpy() for c, df in chr_haplotype_dfs.items()}
-
+    drop_ids = []
+    cis_ranges = {}
     ids = list(phenotype_pos_df.index)
     n = len(ids)
     for k, pid in enumerate(ids, 1):
@@ -252,25 +271,19 @@ def get_cis_ranges(
         chrom = pos['chr']
 
         # Variants
-        if chrom in var_pos:
-            lb = bisect.bisect_left(var_pos[chrom], pos['start'] - window)
-            ub = bisect.bisect_right(var_pos[chrom], pos['end'] + window) - 1
-            variant_r = (var_idx[chrom][lb], var_idx[chrom][ub]) if lb <= ub else None
-        else:
-            variant_r = None
+        lb = bisect.bisect_left(chr_variant_dfs[chrom].values, pos['start'] - window)
+        ub = bisect.bisect_right(chr_variant_dfs[chrom].values, pos['end'] + window)
+        variant_r = chr_variant_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
 
         # Haplotypes
-        if chrom in hap_pos:
-            lb = bisect.bisect_left(hap_pos[chrom], pos['start'] - window)
-            ub = bisect.bisect_right(hap_pos[chrom], pos['end'] + window) - 1
-            haplotype_r = (hap_idx[chrom][lb], hap_idx[chrom][ub]) if lb <= ub else None
-        else:
-            haplotype_r = None
+        lb = bisect.bisect_left(chr_haplotypes_dfs[chrom].values, pos['start'] - window)
+        ub = bisect.bisect_right(chr_haplotypes_dfs[chrom].values, pos['end'] + window)
+        haplotype_r = chr_haplotypes_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
 
         ok = (variant_r is not None) and (haplotype_r is not None) if require_both \
              else (variant_r is not None) or (haplotype_r is not None)
         if ok:
-            cis_ranges[pid] = {"variants": variant_r, "haplotypes": haplotype_r}
+            cis_ranges[pid] = variant_r
         else:
             drop_ids.append(pid)
 
@@ -289,8 +302,8 @@ class InputGeneratorCis:
     variant_df  : DataFrame mapping variant index to ['chrom','pos'] (sorted by genotype row order)
     phenotype_df: (phenotypes x samples) DataFrame
     phenotype_pos_df: DataFrame with ['chr','pos'] or ['chr','start','end'] indexed by phenotype_id
-    loci_df     : Dask array (n_hap_tracks x samples) OR (haplotypes x samples) DataFrame
-    hap_df      : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching loci_df
+    hap_df     : Dask array (n_hap_tracks x samples) OR (haplotypes x samples) DataFrame
+    hap_pos_df      : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching hap_df
     group_s     : optional pd.Series mapping phenotype_id -> group_id
     window      : cis window size
 
@@ -311,8 +324,8 @@ class InputGeneratorCis:
         variant_df: pd.DataFrame,
         phenotype_df: Union[pd.DataFrame, cuDF],
         phenotype_pos_df: pd.DataFrame,
-        loci_df: Union[pd.DataFrame, cuDF, da.Array],
-        hap_df: pd.DataFrame,
+        haplotypes: Union[pd.DataFrame, cuDF, da.Array],
+        hap_pos_df: pd.DataFrame,
         group_s: Optional[pd.Series] = None,
         window: int = 1_000_000,
         require_both: bool = True,
@@ -322,9 +335,8 @@ class InputGeneratorCis:
         self.variant_df = variant_df.copy()
         self.variant_df['index'] = np.arange(self.variant_df.shape[0])
 
-        self.loci_df = loci_df
-        self.hap_df = hap_df.copy()
-        self.hap_df['index'] = np.arange(self.hap_df.shape[0])
+        self.loci_df = loci_df.copy()
+        self.loci_df['index'] = np.arange(self.loci_df.shape[0])
 
         self.phenotype_df = phenotype_df
         self.phenotype_pos_df = phenotype_pos_df.copy()
@@ -341,6 +353,10 @@ class InputGeneratorCis:
         if self.require_both:
             self._filter_phenotypes_by_haplotypes()
         self._drop_constant_phenotypes()
+
+        if isinstance(haplotypes, da.Array):
+            _tmp = haplotypes.compute()
+            self.haplotypes = haplotypes
         self._calculate_cis_ranges()
 
     # ----------------------------
@@ -351,12 +367,12 @@ class InputGeneratorCis:
         assert (self.genotype_df.index == self.variant_df.index).all(), \
             "Genotype and variant DataFrames must share the same index order."
         # Haplotype data
-        if isinstance(self.loci_df, (pd.DataFrame, cuDF)):
-            assert self.loci_df.shape[0] == len(self.hap_df), \
-                "loci_df rows must equal hap_df length."
-        elif isinstance(self.loci_df, da.Array):
-            assert int(self.loci_df.shape[0]) == len(self.hap_df), \
-                "loci_df (dask) first dim must equal hap_df length."
+        if isinstance(self.hap_df, (pd.DataFrame, cuDF)):
+            assert self.hap_df.shape[0] == len(self.loci_df), \
+                "hap_df rows must equal loci_df length."
+        elif isinstance(self.hap_df, da.Array):
+            assert int(self.hap_df.shape[0]) == len(self.loci_df), \
+                "hap_df (dask) first dim must equal loci_df length."
         # Phenotype index uniqueness
         ph_index = self._to_pandas(self.phenotype_df).index
         assert (ph_index == pd.Index(ph_index).unique()).all(), \
@@ -387,7 +403,7 @@ class InputGeneratorCis:
         self.chrs = list(keep_chrs)
 
     def _filter_phenotypes_by_haplotypes(self):
-        hap_chrs = pd.Index(self.hap_df['chrom'].unique())
+        hap_chrs = pd.Index(self.loci_df['chrom'].unique())
         phenotype_chrs = pd.Index(self.phenotype_pos_df['chr'].unique())
         keep_chrs = phenotype_chrs.intersection(hap_chrs)
         m = self.phenotype_pos_df['chr'].isin(keep_chrs)
@@ -414,7 +430,7 @@ class InputGeneratorCis:
         self.chr_variant_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
                                 for c, g in self.variant_df.groupby('chrom', sort=False)}
         self.chr_haplotype_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
-                                  for c, g in self.hap_df.groupby('chrom', sort=False)}
+                                  for c, g in self.loci_df.groupby('chrom', sort=False)}
 
         self.cis_ranges, drop_ids = get_cis_ranges(
             self.phenotype_pos_df,
@@ -547,7 +563,7 @@ class InputGeneratorCis:
 
                 # Haplotype slice
                 h_lb, h_ub = r['haplotypes'] if r['haplotypes'] is not None else (None, None)
-                H = self._slice_rows(self.loci_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy)
+                H = self._slice_rows(self.hap_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy)
                 H_idx = np.arange(h_lb, h_ub + 1) if h_lb is not None else np.arange(0, 0, dtype=int)
 
                 yield p, G, G_idx, H, H_idx, pid
@@ -573,7 +589,7 @@ class InputGeneratorCis:
                 h_lb, h_ub = (min(h_lbs), max(h_ubs)) if len(h_lbs) else (None, None)
 
                 G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None, as_cupy=as_cupy) if v_lb is not None else None
-                H = self._slice_rows(self.loci_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy) if h_lb is not None else None
+                H = self._slice_rows(self.hap_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy) if h_lb is not None else None
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
                 H_idx = np.arange(h_lb, h_ub + 1) if h_lb is not None else np.arange(0, 0, dtype=int)
 
