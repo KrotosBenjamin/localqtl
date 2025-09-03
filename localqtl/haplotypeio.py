@@ -115,7 +115,7 @@ class RFMixReader:
 
         present_mask = ~(variant_loci["_merge"] == "right_only")
         keep_idx = np.where(present_mask.values)[0]
-        self.admix = self.admix.get_orthogonal_selection((keep_idx, slice(None), slice(None)))
+        self.admix = self.admix[present_mask, :, :]
 
         # Guard unknown shapes
         if any(dim is None for dim in self.admix.shape):
