@@ -106,16 +106,18 @@ class RFMixReader:
                              indicator=True)
             .loc[:, ["chrom", "pos", "i", "_merge"]]
         )
+        present_mask = ~(variant_loci["_merge"] == "right_only")
+        keep_idx = np.where(present_mask.values)[0]
 
         # Impute and load zarr
         zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
+        zarr_masked = f"{self.zarr_dir}/local-ancestry.masked.zarr"
         if (not exists(zarr_file)) or impute:
             _ = interpolate_array(variant_loci, admix, self.zarr_dir)
-        self.admix = zarr.open_array(zarr_file, mode='r')  # (variants_aligned x samples x pops)
 
-        present_mask = ~(variant_loci["_merge"] == "right_only")
-        keep_idx = np.where(present_mask.values)[0]
-        self.admix = self.admix[present_mask, :, :]
+        if (not exists(zarr_masked)) or impute:
+            self._filter_zarr(zarr_file, zarr_masked, keep_idx)
+        self.admix = zarr.open_array(zarr_masked, mode='r')  # (variants_aligned x samples x pops)
 
         # Guard unknown shapes
         if any(dim is None for dim in self.admix.shape):
@@ -187,6 +189,14 @@ class RFMixReader:
         """Force-load haplotype ancestry into memory as NumPy array."""
         return np.array(self.haplotypes)
 
+    @staticmethod
+    def _filter_zarr(zarr_in: str, zarr_out: str, indices: np.ndarray,
+                     chunk_size: int = 10_000):
+        """Write a filtered Zarr containing only rows at given indices."""
+        daz = from_zarr(zarr_in)
+        dst = daz[indices, :, :]
+        dst = dst.rechunk((chunk_size, -1, -1))
+        dst.to_zarr(zarr_out, overwrite=True)
 
 # -------------------------------------------------
 # cis-window computation for variants + haplotypes
