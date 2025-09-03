@@ -23,19 +23,20 @@ import zarr
 import bisect, sys
 import numpy as np
 import pandas as pd
+import dask.array as da
 from os.path import exists
 from typing import Dict, List, Optional, Tuple, Union
-
-import cudf
-import cupy as cp
-import dask.array as da
-from cudf import DataFrame as cuDF
-from dask.array import from_array, from_zarr
 
 from genotypeio import background
 from rfmix_reader import read_rfmix, interpolate_array
 
+import cudf
+import cupy as cp
+from cudf import DataFrame as cuDF
+
+arr_mod = cp if cp.is_available() else np
 ArrayLike = Union[np.ndarray, cp.ndarray, da.core.Array]
+
 
 # ----------------------------
 # RFMixReader (refined)
@@ -47,16 +48,12 @@ class RFMixReader:
     ----------
     prefix_path : str
         Directory containing RFMix per-chrom outputs and fb.tsv.
-    variant_df : pd.DataFrame
-        DataFrame with columns ['chrom', 'pos'] in the SAME order as the
-        genotype matrix (variants x samples).
     select_samples : list[str], optional
         Subset of sample IDs to keep (order preserved).
     exclude_chrs : list[str], optional
         Chromosomes to exclude from imputed matrices.
     binary_path : str
         Path with prebuilt binary files (default: "./binary_files").
-    impute : bool
     verbose : bool
     dtype : numpy dtype
 
@@ -77,47 +74,23 @@ class RFMixReader:
     """
 
     def __init__(
-        self, prefix_path: str, variant_df: pd.DataFrame,
+        self, prefix_path: str, #variant_df: pd.DataFrame,
         select_samples: Optional[List[str]] = None,
         exclude_chrs: Optional[List[str]] = None,
         binary_path: str = "./binary_files",
-        impute: bool = False, verbose: bool = True, dtype=np.int8
+        verbose: bool = True, dtype=np.int8
     ):
-        self.zarr_dir = f"{prefix_path}"
+        # self.zarr_dir = f"{prefix_path}"
         bin_dir = f"{binary_path}"
 
-        loci, self.g_anc, admix = read_rfmix(prefix_path, binary_dir=bin_dir,
-                                             verbose=verbose)
-        if admix.ndim != 3:
-            n_vars, total = admix.shape
+        self.loci, self.g_anc, self.admix = read_rfmix(prefix_path,
+                                                       binary_dir=bin_dir,
+                                                       verbose=verbose)
+        if self.admix.ndim != 3:
+            n_vars, total = self.admix.shape
             n_pops = total // len(self.g_anc.sample_id.unique())
             n_samp = total // n_pops
-            admix = admix.reshape(n_vars, n_samp, n_pops)
-        loci = loci.rename(columns={"chromosome": "chrom",
-                                    "physical_position": "pos"})
-
-        # Ensure unique variant positions
-        variant_df = variant_df.drop_duplicates(subset=["chrom", "pos"],
-                                                keep="first").copy()
-
-        # Align variant grid
-        variant_loci = (
-            variant_df.merge(_to_pandas(loci), on=["chrom", "pos"], how="outer",
-                             indicator=True)
-            .loc[:, ["chrom", "pos", "i", "_merge"]]
-        )
-        present_mask = ~(variant_loci["_merge"] == "right_only")
-        keep_idx = np.where(present_mask.values)[0]
-
-        # Impute and load zarr
-        zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
-        zarr_masked = f"{self.zarr_dir}/local-ancestry.masked.zarr"
-        if (not exists(zarr_file)) or impute:
-            _ = interpolate_array(variant_loci, admix, self.zarr_dir)
-
-        if (not exists(zarr_masked)) or impute:
-            self._filter_zarr(zarr_file, zarr_masked, keep_idx)
-        self.admix = zarr.open_array(zarr_masked, mode='r')  # (variants_aligned x samples x pops)
+            self.admix = self.admix.reshape(n_vars, n_samp, n_pops)
 
         # Guard unknown shapes
         if any(dim is None for dim in self.admix.shape):
@@ -125,13 +98,12 @@ class RFMixReader:
                 "Ancestry array has unknown dimensions; expected (variants, samples, ancestries)."
             )
 
-        # Build filtered loci table
-        filtered = variant_loci.loc[present_mask].copy().drop(["i", "_merge"],
-                                                              axis=1).reset_index(drop=True)
-        self.loci = cudf.from_pandas(filtered)
+        # Build loci table
+        self.loci = self.loci.rename(columns={"chromosome": "chrom",
+                                              "physical_position": "pos"})
         self.loci["i"] = cudf.Series(range(len(self.loci)))
         self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
-
+        
         # Subset samples
         self.sample_ids = _get_sample_ids(self.g_anc)
         if select_samples is not None:
@@ -189,14 +161,14 @@ class RFMixReader:
         """Force-load haplotype ancestry into memory as NumPy array."""
         return np.array(self.haplotypes)
 
-    @staticmethod
-    def _filter_zarr(zarr_in: str, zarr_out: str, indices: np.ndarray,
-                     chunk_size: int = 10_000):
-        """Write a filtered Zarr containing only rows at given indices."""
-        daz = from_zarr(zarr_in)
-        dst = daz[indices, :, :]
-        dst = dst.rechunk((chunk_size, -1, -1))
-        dst.to_zarr(zarr_out, overwrite=True)
+    # @staticmethod
+    # def _filter_zarr(zarr_in: str, zarr_out: str, indices: np.ndarray,
+    #                  chunk_size: int = 10_000):
+    #     """Write a filtered Zarr containing only rows at given indices."""
+    #     daz = from_zarr(zarr_in)
+    #     dst = daz[indices, :, :]
+    #     dst = dst.rechunk((chunk_size, -1, -1))
+    #     dst.to_zarr(zarr_out, overwrite=True)
 
 # -------------------------------------------------
 # cis-window computation for variants + haplotypes
@@ -204,14 +176,13 @@ class RFMixReader:
 def get_cis_ranges(
     phenotype_pos_df: pd.DataFrame,
     chr_variant_dfs: Dict[str, pd.DataFrame],
-    chr_haplotype_dfs: Dict[str, pd.DataFrame],
-    window: int, require_both: bool = True, verbose: bool = True):
-    """Compute per-phenotype cis index ranges for variants and haplotypes.
+    window: int, verbose: bool = True):
+    """Compute per-phenotype cis index ranges for variants.
 
     Returns
     -------
     cis_ranges : dict
-        phenotype_id -> {"variants": (lb, ub), "haplotypes": (lb, ub)} (inclusive ranges)
+        phenotype_id -> {"variants": (lb, ub)
     drop_ids : list[str]
         Phenotypes without any eligible window (based on `require_both`).
     """
@@ -240,17 +211,9 @@ def get_cis_ranges(
         ub = bisect.bisect_right(chr_variant_dfs[chrom]['pos'].values, pos['end'] + window)
         variant_r = chr_variant_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
 
-        # Haplotypes
-        lb = bisect.bisect_left(chr_haplotype_dfs[chrom]['pos'].values, pos['start'] - window)
-        ub = bisect.bisect_right(chr_haplotype_dfs[chrom]['pos'].values, pos['end'] + window)
-        haplotype_r = chr_haplotype_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
-
         has_variants = len(variant_r) > 0
-        has_haplotypes = len(haplotype_r) > 0
         
-        ok = (has_variants) and (has_haplotypes) if require_both \
-             else (has_variants) or (has_haplotypes)
-        if ok:
+        if has_variants:
             cis_ranges[pid] = variant_r
         else:
             drop_ids.append(pid)
@@ -270,7 +233,7 @@ class InputGeneratorCis:
     variant_df  : DataFrame mapping variant index to ['chrom','pos'] (sorted by genotype row order)
     phenotype_df: (phenotypes x samples) DataFrame
     phenotype_pos_df: DataFrame with ['chr','pos'] or ['chr','start','end'] indexed by phenotype_id
-    haplotypes  : Zarr or NumPy array (haplotypes x samples x ancestries)
+    haplotypes  : Dask array or NumPy array (haplotypes x samples x ancestries)
     loci_df     : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching haplotypes
     group_s     : optional pd.Series mapping phenotype_id -> group_id
     window      : cis window size
@@ -287,7 +250,7 @@ class InputGeneratorCis:
         variant_df: pd.DataFrame,
         phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame,
-        haplotypes: Union[pd.DataFrame, cuDF, zarr.Array, np.ndarray],
+        haplotypes: Union[pd.DataFrame, cuDF, da.Array, np.ndarray],
         loci_df: Union[pd.DataFrame, cuDF],
         group_s: Optional[pd.Series] = None,
         window: int = 1_000_000,
@@ -314,8 +277,6 @@ class InputGeneratorCis:
         # Validate & filter
         self._validate_data()
         self._filter_phenotypes_by_genotypes()
-        if self.require_both:
-            self._filter_phenotypes_by_haplotypes()
         self._drop_constant_phenotypes()
         self._calculate_cis_ranges()
 
@@ -330,12 +291,9 @@ class InputGeneratorCis:
         if isinstance(self.haplotypes, (pd.DataFrame, cuDF)):
             assert self.haplotypes.shape[0] == len(self.loci_df), \
                 "Haplotypes rows must equal loci information length."
-        elif isinstance(self.haplotypes, (zarr.Array, np.ndarray)):
+        elif isinstance(self.haplotypes, (da.Array, np.ndarray)):
             assert int(self.haplotypes.shape[0]) == len(self.loci_df), \
                 "Haplotypes (dask) first dim must equal loci information length."
-        # Make sure sample match across genotypes and haplotypes
-        assert haplotypes.shape[1] == genotype_df.shape[1], \
-            "Genotypes and haplotypes must have the same samples."
         # Phenotype index uniqueness
         ph_index = self._to_pandas(self.phenotype_df).index
         assert (ph_index == pd.Index(ph_index).unique()).all(), \
@@ -364,17 +322,6 @@ class InputGeneratorCis:
         self.phenotype_pos_df = self.phenotype_pos_df.loc[m]
         self.chrs = list(keep_chrs)
 
-    def _filter_phenotypes_by_haplotypes(self):
-        hap_chrs = pd.Index(self.loci_df['chrom'].unique())
-        phenotype_chrs = pd.Index(self.phenotype_pos_df['chr'].unique())
-        keep_chrs = phenotype_chrs.intersection(hap_chrs)
-        m = self.phenotype_pos_df['chr'].isin(keep_chrs)
-        drop_n = int((~m).sum())
-        if drop_n:
-            print(f"    ** dropping {drop_n} phenotypes on chrs. without haplotypes")
-        self.phenotype_df = self._loc_idx(self.phenotype_df, m)
-        self.phenotype_pos_df = self.phenotype_pos_df.loc[m]
-
     def _drop_constant_phenotypes(self):
         P = self._to_pandas(self.phenotype_df).values
         # constant across samples
@@ -393,17 +340,11 @@ class InputGeneratorCis:
             c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
             for c, g in self.variant_df.groupby('chrom', sort=False)
         }
-        self.chr_haplotype_dfs = {
-            c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
-            for c, g in self.loci_df.groupby('chrom', sort=False)
-        }
 
         self.cis_ranges, drop_ids = get_cis_ranges(
             self.phenotype_pos_df,
             self.chr_variant_dfs,
-            self.chr_haplotype_dfs,
             self.window,
-            require_both=self.require_both,
             verbose=True,
         )
         if drop_ids:
@@ -424,6 +365,43 @@ class InputGeneratorCis:
         else:
             self.phenotype_start = self.phenotype_pos_df['start'].to_dict()
             self.phenotype_end = self.phenotype_pos_df['end'].to_dict()
+
+    @staticmethod
+    def _interpolate_block(block: "arr_mod.ndarray") -> "arr_mod.ndarray":
+        """
+        Interpolate missing values in a 3D haplotype block: (loci, samples, ancestries).
+        
+        Performs linear interpolation along the loci axis (axis=0) for each (sample, ancestry)
+        pair independently. Supports NumPy or CuPy arrays via arr_mod.
+
+        Parameters
+        ----------
+        block : arr_mod.ndarray
+            Haplotype slice of shape (loci, samples, ancestries), potentially with NaNs.
+
+        Returns
+        -------
+        arr_mod.ndarray
+            Same shape as input, with NaNs interpolated (and rounded to integers).
+        """
+        block_imputed = block.copy()
+        loci_dim, sample_dim, ancestry_dim = block.shape
+
+        for s in range(sample_dim):
+            for a in range(ancestry_dim):
+                col = block[:, s, a]
+                mask = arr_mod.isnan(col)
+                if arr_mod.any(mask):
+                    idx = arr_mod.arange(loci_dim)
+                    valid = ~mask
+                    if arr_mod.any(valid):
+                        # Linear interpolation and rounding
+                        interpolated = arr_mod.round(
+                            arr_mod.interp(idx[mask], idx[valid], col[valid])
+                        )
+                        col[mask] = interpolated.astype(int)
+                block_imputed[:, s, a] = col
+        return block_imputed
 
     # ----------------------------
     # Dask-aware row slicers
@@ -476,7 +454,8 @@ class InputGeneratorCis:
         self, chrom: Optional[str] = None,
         verbose: bool = False, as_cupy: bool = True,
     ):
-        """Yield batches for cis mapping.
+        """
+        Yield batches for cis mapping with on-the-fly haplotype imputation.
 
         Yields
         ------
@@ -484,7 +463,6 @@ class InputGeneratorCis:
         variants:  2D array (n_variants_in_window x samples)
         v_index:   1D array of variant row indices (global)
         haplotypes:2D array (n_haps_in_window x samples)
-        h_index:   1D array of haplotype row indices (global)
         phenotype_id: str or list[str] if grouped
         [group_id]: optional, when grouped
         """
@@ -509,8 +487,13 @@ class InputGeneratorCis:
                 # Variant  and haplotype slice
                 v_lb, v_ub = r if r is not None else (None, None)
                 G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None)
-                H = self._slice_rows(self.haplotypes, v_lb, (v_ub + 1) if v_ub is not None else None)
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
+
+                H = None
+                if v_lb is not None and v_ub is not None:
+                    H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
+                    H_block = H_slice.compute()
+                    H = self._interpolate_block(H_block)
 
                 yield p, G, G_idx, H, pid
         else:
@@ -532,8 +515,13 @@ class InputGeneratorCis:
                 v_lb, v_ub = (min(v_lbs), max(v_ubs)) if len(v_lbs) else (None, None)
 
                 G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None) if v_lb is not None else None
-                H = self._slice_rows(self.haplotypes, v_lb, (v_ub + 1) if h_ub is not None else None) if h_lb is not None else None
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
+
+                H = None
+                if v_lb is not None and v_ub is not None:
+                    H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
+                    H_block = H_slice.compute()
+                    H = self._interpolate_block(H_block)
 
                 yield p, G, G_idx, H, ids, group_id
 
@@ -594,3 +582,31 @@ def _print_progress(k: int, n: int, entity: str) -> None:
 #             return arr.to_cupy() if as_cupy else arr
 #         arr = df_or_da.iloc[idxs].to_numpy(copy=False)
 #         return cp.asarray(arr) if as_cupy else arr
+
+        # # Ensure unique variant positions
+        # variant_df = variant_df.drop_duplicates(subset=["chrom", "pos"],
+        #                                         keep="first").copy()
+
+        # # Align variant grid
+        # variant_loci = (
+        #     variant_df.merge(_to_pandas(loci), on=["chrom", "pos"], how="outer",
+        #                      indicator=True)
+        #     .loc[:, ["chrom", "pos", "i", "_merge"]]
+        # )
+        # present_mask = ~(variant_loci["_merge"] == "right_only")
+        # keep_idx = np.where(present_mask.values)[0]
+
+        # # Impute and load zarr
+        # zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
+        # zarr_masked = f"{self.zarr_dir}/local-ancestry.masked.zarr"
+        # if (not exists(zarr_file)) or impute:
+        #     _ = interpolate_array(variant_loci, admix, self.zarr_dir)
+
+        # if (not exists(zarr_masked)) or impute:
+        #     self._filter_zarr(zarr_file, zarr_masked, keep_idx)
+        # self.admix = zarr.open_array(zarr_masked, mode='r')  # (variants_aligned x samples x pops)
+
+        # # Build filtered loci table
+        # filtered = variant_loci.loc[present_mask].copy().drop(["i", "_merge"],
+        #                                                       axis=1).reset_index(drop=True)
+        # self.loci = cudf.from_pandas(filtered)
