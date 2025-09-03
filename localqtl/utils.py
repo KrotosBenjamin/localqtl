@@ -54,7 +54,7 @@ def _log_mapping_context(genotype_df, haplotype_df, group_s, window,
     if group_s is not None:
         logger.write(f"  * {len(group_s.unique())} phenotype groups")
     logger.write(f"  * {genotype_df.shape[0]} variants")
-    if haplotype_df is not None and not haplotype_df.empty:
+    if haplotype_df is not None and getattr(haplotype_df, 'shape', None) and haplotype_df.shape[0] > 0:
         logger.write("  * including haplotype/ancestry tracks")
     if random_tiebreak:
         logger.write("  * randomly selecting top variant in case of ties")
