@@ -114,7 +114,7 @@ def _process_phenotype_window(
         - result_dict: dictionary of results (same structure as chr_res block)
         - top_hit: Series with top association (or None)
     """
-    phenotypes, genotypes, g_idx, haplotypes, phenotype_ids = row
+    phenotype, genotypes, g_idx, haplotypes, phenotype_id = row
 
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
