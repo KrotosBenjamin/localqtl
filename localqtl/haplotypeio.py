@@ -19,6 +19,7 @@ from __future__ import annotations
 # ----------------------------
 # Imports
 # ----------------------------
+import zarr
 import bisect, sys
 import numpy as np
 import pandas as pd
@@ -57,9 +58,7 @@ class RFMixReader:
         Path with prebuilt binary files (default: "./binary_files").
     impute : bool
     verbose : bool
-    dtype : cupy dtype
-    target_mb : int
-        Approximate target chunk size (MB) for rechunking.
+    dtype : numpy dtype
 
     Attributes
     ----------
@@ -82,8 +81,7 @@ class RFMixReader:
         select_samples: Optional[List[str]] = None,
         exclude_chrs: Optional[List[str]] = None,
         binary_path: str = "./binary_files",
-        impute: bool = False, verbose: bool = True, dtype=cp.int8,
-        target_mb: int = 256,
+        impute: bool = False, verbose: bool = True, dtype=np.int8
     ):
         self.zarr_dir = f"{prefix_path}"
         bin_dir = f"{binary_path}"
@@ -113,11 +111,11 @@ class RFMixReader:
         zarr_file = f"{self.zarr_dir}/local-ancestry.zarr"
         if (not exists(zarr_file)) or impute:
             _ = interpolate_array(variant_loci, admix, self.zarr_dir)
-        daz = from_zarr(zarr_file)  # (variants_aligned x samples x pops)
+        self.admix = zarr.open_array(zarr_file, mode='r')  # (variants_aligned x samples x pops)
 
         present_mask = ~(variant_loci["_merge"] == "right_only")
-        idx_arr = from_array(variant_loci.index.values[present_mask.values])
-        self.admix = daz[idx_arr]  # shape (variants, samples, ancestries)
+        keep_idx = np.where(present_mask.values)[0]
+        self.admix = self.admix.get_orthogonal_selection((keep_idx, slice(None), slice(None)))
 
         # Guard unknown shapes
         if any(dim is None for dim in self.admix.shape):
@@ -156,11 +154,6 @@ class RFMixReader:
         self.n_pops = int(self.admix.shape[2])
         self.variant_ids = variant_df.index.to_numpy()
 
-        # Rechunk for efficiency
-        self.admix = self._efficient_rechunk(
-            self.admix, target_mb=target_mb, align_chunks=(None, 200, self.n_pops)
-        )
-        
         # Build hap tables
         if self.n_pops == 2:
             A0 = self.admix[:, :, [0]]
@@ -190,47 +183,9 @@ class RFMixReader:
                             for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
             self.haplotypes = self.admix  # dask array
 
-    def _efficient_rechunk(self, arr: da.Array, target_mb: int = 256,
-                           align_chunks: tuple | None = None, balance: bool = True) -> da.Array:
-        """Rechunk array into memory-efficient blocks."""
-        dtype_size = arr.dtype.itemsize
-        shape = arr.shape
-        n_axes = arr.ndim
-        target_bytes = target_mb * 1024**2
-
-        new_chunks = list(arr.chunksize)
-
-        for ax in range(n_axes):
-            if align_chunks is not None and align_chunks[ax] is not None:
-                new_chunks[ax] = align_chunks[ax]
-                continue
-
-            per_unit = np.prod([shape[d] if d != ax else 1 for d in range(n_axes)])
-            per_unit_bytes = per_unit * dtype_size
-
-            if per_unit_bytes < target_bytes:
-                max_len = target_bytes // per_unit_bytes
-                new_chunks[ax] = min(shape[ax], int(max_len))
-            else:
-                new_chunks[ax] = shape[ax]
-
-        return arr.rechunk(tuple(new_chunks), balance=balance)
-
-    def load_haplotypes(self) -> np.array:
-        return np.asarray(self.haplotypes.compute())
-
-
-# ----------------------------
-# Helpers functions
-# ----------------------------
-def _to_pandas(df: Union[cuDF, pd.DataFrame, cudf.Series, pd.Series]) -> pd.DataFrame | pd.Series:
-    return df.to_pandas() if isinstance(df, (cuDF, cudf.Series)) else df
-
-
-def _get_sample_ids(df: Union[cuDF, pd.DataFrame]) -> List[str]:
-    if isinstance(df, cuDF):
-        return df["sample_id"].to_arrow().to_pylist()
-    return df["sample_id"].tolist()
+    def load_haplotypes(self) -> np.ndarray:
+        """Force-load haplotype ancestry into memory as NumPy array."""
+        return np.array(self.haplotypes)
 
 
 # -------------------------------------------------
@@ -271,17 +226,20 @@ def get_cis_ranges(
         chrom = pos['chr']
 
         # Variants
-        lb = bisect.bisect_left(chr_variant_dfs[chrom].values, pos['start'] - window)
-        ub = bisect.bisect_right(chr_variant_dfs[chrom].values, pos['end'] + window)
+        lb = bisect.bisect_left(chr_variant_dfs[chrom]['pos'].values, pos['start'] - window)
+        ub = bisect.bisect_right(chr_variant_dfs[chrom]['pos'].values, pos['end'] + window)
         variant_r = chr_variant_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
 
         # Haplotypes
-        lb = bisect.bisect_left(chr_haplotypes_dfs[chrom].values, pos['start'] - window)
-        ub = bisect.bisect_right(chr_haplotypes_dfs[chrom].values, pos['end'] + window)
-        haplotype_r = chr_haplotypes_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
+        lb = bisect.bisect_left(chr_haplotype_dfs[chrom]['pos'].values, pos['start'] - window)
+        ub = bisect.bisect_right(chr_haplotype_dfs[chrom]['pos'].values, pos['end'] + window)
+        haplotype_r = chr_haplotype_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
 
-        ok = (variant_r is not None) and (haplotype_r is not None) if require_both \
-             else (variant_r is not None) or (haplotype_r is not None)
+        has_variants = len(variant_r) > 0
+        has_haplotypes = len(haplotype_r) > 0
+        
+        ok = (has_variants) and (has_haplotypes) if require_both \
+             else (has_variants) or (has_haplotypes)
         if ok:
             cis_ranges[pid] = variant_r
         else:
@@ -290,20 +248,20 @@ def get_cis_ranges(
     return cis_ranges, drop_ids
 
 
-# ----------------------------
-# Input generator (refactored)
-# ----------------------------
+# -------------------------------
+# Input generator for haplotypes
+# -------------------------------
 class InputGeneratorCis:
     """Input generator for cis mapping (variants + local ancestry haplotypes).
 
     Inputs
     ------
-    genotype_df : (variants x samples) DataFrame (pd or cuDF)
+    genotype_df : (variants x samples) DataFrame
     variant_df  : DataFrame mapping variant index to ['chrom','pos'] (sorted by genotype row order)
     phenotype_df: (phenotypes x samples) DataFrame
     phenotype_pos_df: DataFrame with ['chr','pos'] or ['chr','start','end'] indexed by phenotype_id
-    hap_df     : Dask array (n_hap_tracks x samples) OR (haplotypes x samples) DataFrame
-    hap_pos_df      : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching hap_df
+    haplotypes  : Zarr or NumPy array (haplotypes x samples x ancestries)
+    loci_df     : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching haplotypes
     group_s     : optional pd.Series mapping phenotype_id -> group_id
     window      : cis window size
 
@@ -311,21 +269,16 @@ class InputGeneratorCis:
     --------------------
     phenotype (1D), variants (2D slice), variants_index (1D),
     haplotypes (2D slice), haplotypes_index (1D), phenotype_id
-
-    Notes
-    -----
-    - Uses background prefetch for overlap with compute.
-    - Returns GPU arrays (CuPy) if as_cupy=True, else returns DataFrames.
     """
 
     def __init__(
         self,
-        genotype_df: Union[pd.DataFrame, cuDF],
+        genotype_df: pd.DataFrame,
         variant_df: pd.DataFrame,
-        phenotype_df: Union[pd.DataFrame, cuDF],
+        phenotype_df: pd.DataFrame,
         phenotype_pos_df: pd.DataFrame,
-        haplotypes: Union[pd.DataFrame, cuDF, da.Array],
-        hap_pos_df: pd.DataFrame,
+        haplotypes: Union[pd.DataFrame, cuDF, zarr.Array, np.ndarray],
+        loci_df: Union[pd.DataFrame, cuDF],
         group_s: Optional[pd.Series] = None,
         window: int = 1_000_000,
         require_both: bool = True,
@@ -337,6 +290,7 @@ class InputGeneratorCis:
 
         self.loci_df = loci_df.copy()
         self.loci_df['index'] = np.arange(self.loci_df.shape[0])
+        self.haplotypes = haplotypes  # Keep Zarr array
 
         self.phenotype_df = phenotype_df
         self.phenotype_pos_df = phenotype_pos_df.copy()
@@ -353,10 +307,6 @@ class InputGeneratorCis:
         if self.require_both:
             self._filter_phenotypes_by_haplotypes()
         self._drop_constant_phenotypes()
-
-        if isinstance(haplotypes, da.Array):
-            _tmp = haplotypes.compute()
-            self.haplotypes = haplotypes
         self._calculate_cis_ranges()
 
     # ----------------------------
@@ -367,20 +317,22 @@ class InputGeneratorCis:
         assert (self.genotype_df.index == self.variant_df.index).all(), \
             "Genotype and variant DataFrames must share the same index order."
         # Haplotype data
-        if isinstance(self.hap_df, (pd.DataFrame, cuDF)):
-            assert self.hap_df.shape[0] == len(self.loci_df), \
-                "hap_df rows must equal loci_df length."
-        elif isinstance(self.hap_df, da.Array):
-            assert int(self.hap_df.shape[0]) == len(self.loci_df), \
-                "hap_df (dask) first dim must equal loci_df length."
+        if isinstance(self.haplotypes, (pd.DataFrame, cuDF)):
+            assert self.haplotypes.shape[0] == len(self.loci_df), \
+                "Haplotypes rows must equal loci information length."
+        elif isinstance(self.haplotypes, (zarr.Array, np.ndarray)):
+            assert int(self.haplotypes.shape[0]) == len(self.loci_df), \
+                "Haplotypes (dask) first dim must equal loci information length."
+        # Make sure sample match across genotypes and haplotypes
+        assert haplotypes.shape[1] == genotype_df.shape[1], \
+            "Genotypes and haplotypes must have the same samples."
         # Phenotype index uniqueness
         ph_index = self._to_pandas(self.phenotype_df).index
         assert (ph_index == pd.Index(ph_index).unique()).all(), \
             "Phenotype DataFrame index must be unique."
         # Phenotype index alignment (important for masks)
-        ph_idx = self._to_pandas(self.phenotype_df).index
-        assert ph_idx.equals(self.phenotype_pos_df.index), \
-            "phenotype_df and phenotype_pos_df must have identical index order."
+        assert ph_index.equals(self.phenotype_pos_df.index), \
+            "Phenotype DataFrame and position must have identical index order."
 
     def _loc_idx(self, df: Union[pd.DataFrame, cuDF], mask: Union[np.ndarray, pd.Series]
                  ) -> Union[pd.DataFrame, cuDF]:
@@ -427,10 +379,14 @@ class InputGeneratorCis:
 
     def _calculate_cis_ranges(self):
         # Build per-chrom position/index tables (sorted)
-        self.chr_variant_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
-                                for c, g in self.variant_df.groupby('chrom', sort=False)}
-        self.chr_haplotype_dfs = {c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
-                                  for c, g in self.loci_df.groupby('chrom', sort=False)}
+        self.chr_variant_dfs = {
+            c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
+            for c, g in self.variant_df.groupby('chrom', sort=False)
+        }
+        self.chr_haplotype_dfs = {
+            c: g[['pos', 'index']].sort_values('pos').reset_index(drop=True)
+            for c, g in self.loci_df.groupby('chrom', sort=False)
+        }
 
         self.cis_ranges, drop_ids = get_cis_ranges(
             self.phenotype_pos_df,
@@ -463,47 +419,31 @@ class InputGeneratorCis:
     # Dask-aware row slicers
     # ----------------------------
     @staticmethod
-    def _slice_rows(df_or_da, lb: Optional[int], ub: Optional[int], as_cupy: bool = True):
-        """
-        Slice rows from DataFrame/cuDF/Dask array.
-        If Dask array, only compute() the slice.
-        """
-        if lb is None:
+    def _slice_rows(arr, lb: Optional[int], ub: Optional[int]):
+        """Row slice from DF/cuDF/Zarr/NumPy."""
+        if lb is None or ub is None or lb < 0 or ub <= lb:
             return None
-        # Dask array
-        if isinstance(df_or_da, da.Array):
-            arr = df_or_da[lb:ub]
-            out = arr.compute()  # materialize only this slice
-            return cp.asarray(out) if as_cupy else out
-        # cuDF
-        if isinstance(df_or_da, cuDF):
-            view = df_or_da.iloc[lb:ub]
-            return view.to_cupy() if as_cupy else view
-        # pandas DataFrame
-        view = df_or_da.iloc[lb:ub].to_numpy(copy=False)
-        return cp.asarray(view) if as_cupy else view
+        if isinstance(arr, (pd.DataFrame, cuDF)):
+            return arr.iloc[lb:ub].to_numpy()
+        if isinstance(arr, (zarr.Array, np.ndarray)):
+            return np.asarray(arr[lb:ub])
+        return TypeError(f"Unsupported haplotype type: {type(arr)}")
 
     @staticmethod
-    def _row(df_or_da, i: int, as_cupy: bool = True):
-        if isinstance(df_or_da, da.Array):
-            out = df_or_da[i].compute()
-            return cp.asarray(out) if as_cupy else out
-        if isinstance(df_or_da, cuDF):
-            arr = df_or_da.iloc[i]
-            return arr.to_cupy() if as_cupy else arr
-        arr = df_or_da.iloc[i].to_numpy(copy=False)
-        return cp.asarray(arr) if as_cupy else arr
+    def _row(arr, i: int):
+        if isinstance(arr, (pd.DataFrame, cuDF)):
+            return arr.iloc[i].to_numpy()
+        if isinstance(arr, (zarr.Array, np.ndarray)):
+            return np.asarray(arr[i])
+        raise TypeError(f"Unsupported haplotype type: {type(arr)}")
 
     @staticmethod
-    def _rows(df_or_da, idxs: List[int], as_cupy: bool = True):
-        if isinstance(df_or_da, da.Array):
-            out = df_or_da[idxs].compute()
-            return cp.asarray(out) if as_cupy else out
-        if isinstance(df_or_da, cuDF):
-            arr = df_or_da.iloc[idxs]
-            return arr.to_cupy() if as_cupy else arr
-        arr = df_or_da.iloc[idxs].to_numpy(copy=False)
-        return cp.asarray(arr) if as_cupy else arr
+    def _rows(arr, idxs: List[int]):
+        if isinstance(arr, (pd.DataFrame, cuDF)):
+            return arr.iloc[idxs].to_numpy()
+        if isinstance(arr, (zarr.Array, np.ndarray)):
+            return np.asarray(arr[idxs])
+        raise TypeError(f"Unsupported haplotype type: {type(arr)}")
 
     # ----------------------------
     # Utilities
@@ -552,21 +492,17 @@ class InputGeneratorCis:
             for k, pid in enumerate(phenotype_ids, chr_offset + 1):
                 if verbose:
                     _print_progress(k, self.n_phenotypes, 'phenotype')
-
-                p = self._row(self.phenotype_df, index_of[pid], as_cupy=as_cupy).ravel()
+                    
+                p = self._row(self.phenotype_df, index_of[pid]).ravel()
                 r = self.cis_ranges[pid]
 
-                # Variant slice
-                v_lb, v_ub = r['variants'] if r['variants'] is not None else (None, None)
-                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None, as_cupy=as_cupy)
+                # Variant  and haplotype slice
+                v_lb, v_ub = r if r is not None else (None, None)
+                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None)
+                H = self._slice_rows(self.haplotypes, v_lb, (v_ub + 1) if v_ub is not None else None)
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
 
-                # Haplotype slice
-                h_lb, h_ub = r['haplotypes'] if r['haplotypes'] is not None else (None, None)
-                H = self._slice_rows(self.hap_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy)
-                H_idx = np.arange(h_lb, h_ub + 1) if h_lb is not None else np.arange(0, 0, dtype=int)
-
-                yield p, G, G_idx, H, H_idx, pid
+                yield p, G, G_idx, H, pid
         else:
             # Grouped mode: all phenotypes in group must share ranges or we take union
             grouped = self.group_s.loc[phenotype_ids].groupby(self.group_s, sort=False)
@@ -576,32 +512,75 @@ class InputGeneratorCis:
 
                 ids = list(g.index)
                 idxs = [index_of[i] for i in ids]
-                p = self._rows(self.phenotype_df, idxs, as_cupy=as_cupy)
+                p = self._rows(self.phenotype_df, idxs)
 
                 # Validate identical ranges; if not, take union
                 ranges = [self.cis_ranges[i] for i in ids]
-                v_lbs = [r['variants'][0] for r in ranges if r['variants'] is not None]
-                v_ubs = [r['variants'][1] for r in ranges if r['variants'] is not None]
-                h_lbs = [r['haplotypes'][0] for r in ranges if r['haplotypes'] is not None]
-                h_ubs = [r['haplotypes'][1] for r in ranges if r['haplotypes'] is not None]
+                v_lbs = [r[0] for r in ranges if r is not None]
+                v_ubs = [r[1] for r in ranges if r is not None]
 
                 v_lb, v_ub = (min(v_lbs), max(v_ubs)) if len(v_lbs) else (None, None)
-                h_lb, h_ub = (min(h_lbs), max(h_ubs)) if len(h_lbs) else (None, None)
 
-                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None, as_cupy=as_cupy) if v_lb is not None else None
-                H = self._slice_rows(self.hap_df, h_lb, (h_ub + 1) if h_ub is not None else None, as_cupy=as_cupy) if h_lb is not None else None
+                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None) if v_lb is not None else None
+                H = self._slice_rows(self.haplotypes, v_lb, (v_ub + 1) if h_ub is not None else None) if h_lb is not None else None
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
-                H_idx = np.arange(h_lb, h_ub + 1) if h_lb is not None else np.arange(0, 0, dtype=int)
 
-                yield p, G, G_idx, H, H_idx, ids, group_id
+                yield p, G, G_idx, H, ids, group_id
 
 
 # ----------------------------
-# Simple progress printer
+# Helpers functions
 # ----------------------------
+def _to_pandas(df: Union[cuDF, pd.DataFrame, cudf.Series, pd.Series]) -> pd.DataFrame | pd.Series:
+    return df.to_pandas() if isinstance(df, (cuDF, cudf.Series)) else df
+
+
+def _get_sample_ids(df: Union[cuDF, pd.DataFrame]) -> List[str]:
+    if isinstance(df, cuDF):
+        return df["sample_id"].to_arrow().to_pylist()
+    return df["sample_id"].tolist()
+
+
 def _print_progress(k: int, n: int, entity: str) -> None:
     msg = f"\r    processing {entity} {k}/{n}"
     if k == n:
         msg += "\n"
     sys.stdout.write(msg)
     sys.stdout.flush()
+
+
+# def _slice_rows(df_or_da, lb: Optional[int], ub: Optional[int], as_cupy: bool = True):
+#     if lb is None or ub is None or lb < 0 or ub <= lb:
+#         return None
+#     # Dask array
+#     if isinstance(df_or_da, da.Array):
+#         out = df_or_da[lb:ub].compute()
+#         return cp.asarray(out) if as_cupy else out
+#     # cuDF
+#     if isinstance(df_or_da, cuDF):
+#         view = df_or_da.iloc[lb:ub]
+#         return view.to_cupy() if as_cupy else view
+#     # pandas DataFrame
+#     view = df_or_da.iloc[lb:ub].to_numpy(copy=False)
+#     return cp.asarray(view) if as_cupy else view
+
+# def _row(df_or_da, i: int, as_cupy: bool = True):
+#     if isinstance(df_or_da, da.Array):
+#         out = df_or_da[i].compute()
+#         return cp.asarray(out) if as_cupy else out
+#     if isinstance(df_or_da, cuDF):
+#         arr = df_or_da.iloc[i]
+#         return arr.to_cupy() if as_cupy else arr
+#     arr = df_or_da.iloc[i].to_numpy(copy=False)
+#     return cp.asarray(arr) if as_cupy else arr
+
+#     @staticmethod
+#     def _rows(df_or_da, idxs: List[int], as_cupy: bool = True):
+#         if isinstance(df_or_da, da.Array):
+#             out = df_or_da[idxs].compute()
+#             return cp.asarray(out) if as_cupy else out
+#         if isinstance(df_or_da, cuDF):
+#             arr = df_or_da.iloc[idxs]
+#             return arr.to_cupy() if as_cupy else arr
+#         arr = df_or_da.iloc[idxs].to_numpy(copy=False)
+#         return cp.asarray(arr) if as_cupy else arr
