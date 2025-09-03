@@ -15,7 +15,7 @@ from core import (
     filter_maf_interaction
 )
 
-def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device):
+def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device, mode="flatten"):
     """Prepare genotype/haplotype tensors and impute missing."""
     genotypes_t = _prepare_tensor(genotypes, device=device)[:, genotype_ix_t]
     impute_mean(genotypes_t)
@@ -34,14 +34,18 @@ def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device):
             if n_anc == 2:
                 haplotypes_t = haplotypes_arr[:, :, 0]
             else:
-                haplotypes_t = haplotypes_arr.reshape(n_var, -1)
+                haplotypes_t = haplotypes_arr.mean(dim=2)
         else:
             raise ValueError(f"Unexpected haplotype tensor shape {haplotypes_arr.shape}")
 
     # Double-check variant alignment
     if haplotypes_t.shape[0] != genotypes_t.shape[0]:
-        haplotypes_t = None
-
+        raise ValueError(
+            f"Shape mismatch between genotypes ({genotypes_t.shape}) "
+            f"and haplotypes ({haplotypes_t.shape}) after slicing."
+        )
+    assert genotypes_t.shape[0] == haplotypes_t.shape[0], \
+        f"Mismatch: G={geontypes_t.shape}, H={haplotypes_t.shape}"
     return genotypes_t, haplotypes_t
 
 
@@ -50,7 +54,7 @@ def _log_mapping_context(genotype_df, haplotype_df, group_s, window,
     if group_s is not None:
         logger.write(f"  * {len(group_s.unique())} phenotype groups")
     logger.write(f"  * {genotype_df.shape[0]} variants")
-    if haplotype_df is not None:
+    if haplotype_df is not None and not haplotype_df.empty:
         logger.write("  * including haplotype/ancestry tracks")
     if random_tiebreak:
         logger.write("  * randomly selecting top variant in case of ties")
@@ -239,7 +243,8 @@ def _init_result_dict(n, interaction_df, phenotype_pos_df):
         chr_res['slope'] = np.empty(n, dtype=np.float32)
         chr_res['slope_se'] = np.empty(n, dtype=np.float32)
     else:
-        ni = interaction_df.shape[1]
+        if interaction_df is not None and isinstance(interaction_df, pd.DataFrame):
+            ni = interaction_df.shape[1]
         chr_res['pval_g'] = np.empty(n, dtype=np.float64)
         chr_res['b_g'] = np.empty(n, dtype=np.float32)
         chr_res['b_g_se'] = np.empty(n, dtype=np.float32)
@@ -272,9 +277,24 @@ def _count_pairs_for_chromosome(igc, chrom, group_s):
 def _merge_results(chr_res, chr_block, start, n_i):
     """Insert block of results into chr_res in-place."""
     for k, v in chr_block.items():
-        if isinstance(v, list):
+        if isinstance(chr_res[k], list):
             chr_res[k].extend(v)
         else:
+            v = np.asarray(v)
+            # If 2D and target is 1D, flatten if second dim == 1
+            if v.ndim == 2 and chr_res[k].ndim == 1:
+                if v.shape[1] == 1:
+                    v = v.ravel()
+                else:
+                    raise ValueError(f"Cannot assign matrix of shape {v.shape} into 1D array for key: {k}")
+
+            # If dimensions match, assign
+            expected_shape = chr_res[k][start:start + n_i].shape
+            if v.shape != expected_shape:
+                raise ValueError(
+                    f"Incompatible shape for chr_res[{k}]: expected {expected_shape}, got {v.shape}"
+                )
+
             chr_res[k][start:start + n_i] = v
 
 
@@ -349,7 +369,8 @@ def _write_chromosome_results(
                 chr_res_df.loc[mask, 'pval_nominal'], idof if isinstance(idof, int) else idof[mask], log=logp
             )
     else:
-        ni = interaction_df.shape[1]
+        if interaction_df is not None and isinstance(interaction_df, pd.DataFrame):
+            ni = interaction_df.shape[1]
         if ni == 1:
             for col in ['pval_g', 'pval_i', 'pval_gi']:
                 mask = chr_res_df[col].notnull()
@@ -408,7 +429,8 @@ def _summarize_top_associations(
     top_df.index = top_df['phenotype_id']
     top_df = top_df.infer_objects()
 
-    ni = interaction_df.shape[1]
+    if interaction_df is not None and isinstance(interaction_df, pd.DataFrame):
+        ni = interaction_df.shape[1]
 
     # Convert t-stats to p-values
     m = top_df['pval_g'].notnull()

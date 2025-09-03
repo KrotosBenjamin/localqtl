@@ -412,7 +412,7 @@ def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
     phenotype_var_t = p_var # same across all chunks
 
     # Degrees of freedom
-    dof = residualizer.dof if residualizer is not None else p.shape[1] - 2
+    dof = residualizer.dof if residualizer is not None else phenotype_t.shape[1] - 2
     dof = float(dof)
 
     # Association statistics

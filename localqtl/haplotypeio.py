@@ -155,9 +155,9 @@ class RFMixReader:
                             for c, g in self.loci_df.reset_index().groupby("chrom", sort=False)}
             self.haplotypes = self.admix  # dask array
 
-    def load_haplotypes(self) -> np.ndarray:
+    def load_haplotypes(self):
         """Force-load haplotype ancestry into memory as NumPy array."""
-        return np.array(self.haplotypes)
+        return self.haplotypes.compute()
 
     # @staticmethod
     # def _filter_zarr(zarr_in: str, zarr_out: str, indices: np.ndarray,
@@ -207,7 +207,7 @@ def get_cis_ranges(
         # Variants
         lb = bisect.bisect_left(chr_variant_dfs[chrom]['pos'].values, pos['start'] - window)
         ub = bisect.bisect_right(chr_variant_dfs[chrom]['pos'].values, pos['end'] + window)
-        variant_r = chr_variant_dfs[chrom]['index'].values[[lb, ub -1]] if lb != ub else []
+        variant_r = (lb, ub - 1) if lb != ub else None
 
         has_variants = len(variant_r) > 0
         
@@ -489,9 +489,11 @@ class InputGeneratorCis:
                     
                 p = self._row(self.phenotype_df, index_of[pid]).ravel()
                 r = self.cis_ranges[pid]
+                if r is None:
+                    continue
 
                 # Variant  and haplotype slice
-                v_lb, v_ub = r if r is not None else (None, None)
+                v_lb, v_ub = r
                 G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None)
                 G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
 
@@ -501,9 +503,12 @@ class InputGeneratorCis:
                     if self.on_the_fly_impute:
                         H_block = H_slice.compute()
                         H = self._interpolate_block(H_block)
+                        if H is not None and H.ndim == 3 and H.shape[2] == 1:
+                            H = H.reshape(H.shape[0], H.shape[1])
                     else:
                         H = H_slice.compute() # for FLARE input
 
+                print(f"[DEBUG] H.shape = {H.shape} | v_lb = {v_lb}, v_ub = {v_ub}")
                 yield p, G, G_idx, H, pid
         else:
             # Grouped mode: all phenotypes in group must share ranges or we take union
@@ -529,9 +534,13 @@ class InputGeneratorCis:
                 H = None
                 if v_lb is not None and v_ub is not None:
                     H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
-                    H_block = H_slice.compute()
-                    H = self._interpolate_block(H_block)
-
+                    if self.on_the_fly_impute:
+                        H_block = H_slice.compute()
+                        H = self._interpolate_block(H_block)
+                        if H is not None and H.ndim == 3 and H.shape[2] == 1:
+                            H = H.reshape(H.shape[0], H.shape[1])
+                    else:
+                        H = H_slice.compute() # FLARE compatible
                 yield p, G, G_idx, H, ids, group_id
 
 
