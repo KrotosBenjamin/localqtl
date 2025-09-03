@@ -34,7 +34,6 @@ import cudf
 import cupy as cp
 from cudf import DataFrame as cuDF
 
-arr_mod = cp if cp.is_available() else np
 ArrayLike = Union[np.ndarray, cp.ndarray, da.core.Array]
 
 
@@ -366,7 +365,7 @@ class InputGeneratorCis:
             self.phenotype_end = self.phenotype_pos_df['end'].to_dict()
 
     @staticmethod
-    def _interpolate_block(block: "arr_mod.ndarray") -> "arr_mod.ndarray":
+    def _interpolate_block(block) -> "np.ndarray":
         """
         Interpolate missing values in a 3D haplotype block: (loci, samples, ancestries).
         
@@ -383,20 +382,25 @@ class InputGeneratorCis:
         arr_mod.ndarray
             Same shape as input, with NaNs interpolated (and rounded to integers).
         """
+        if 'cupy' in str(type(block)):
+            mod = cp
+        else:
+            mod = np
+
         block_imputed = block.copy()
         loci_dim, sample_dim, ancestry_dim = block.shape
 
         for s in range(sample_dim):
             for a in range(ancestry_dim):
                 col = block[:, s, a]
-                mask = arr_mod.isnan(col)
-                if arr_mod.any(mask):
-                    idx = arr_mod.arange(loci_dim)
+                mask = mod.isnan(col)
+                if mod.any(mask):
+                    idx = mod.arange(loci_dim)
                     valid = ~mask
-                    if arr_mod.any(valid):
+                    if mod.any(valid):
                         # Linear interpolation and rounding
-                        interpolated = arr_mod.round(
-                            arr_mod.interp(idx[mask], idx[valid], col[valid])
+                        interpolated = mod.round(
+                            mod.interp(idx[mask], idx[valid], col[valid])
                         )
                         col[mask] = interpolated.astype(int)
                 block_imputed[:, s, a] = col
