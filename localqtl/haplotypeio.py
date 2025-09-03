@@ -201,17 +201,20 @@ def get_cis_ranges(
     for k, pid in enumerate(ids, 1):
         if verbose and (k % 1000 == 0 or k == n):
             print(f"\r  * checking phenotypes: {k}/{n}", end='' if k != n else None)
+
         pos = phenotype_pos_dict[pid]
         chrom = pos['chr']
 
         # Variants
-        lb = bisect.bisect_left(chr_variant_dfs[chrom]['pos'].values, pos['start'] - window)
-        ub = bisect.bisect_right(chr_variant_dfs[chrom]['pos'].values, pos['end'] + window)
-        variant_r = (lb, ub - 1) if lb != ub else None
+        variant_r = None
+        if chrom in chr_variant_dfs:
+            pos_array = chr_variant_dfs[chrom]['pos'].values
+            lb = bisect.bisect_left(pos_array, pos['start'] - window)
+            ub = bisect.bisect_right(pos_array, pos['end'] + window)
+            if lb < ub:
+                variant_r = (lb, ub - 1)
 
-        has_variants = len(variant_r) > 0
-        
-        if has_variants:
+        if variant_r is not None:
             cis_ranges[pid] = variant_r
         else:
             drop_ids.append(pid)
