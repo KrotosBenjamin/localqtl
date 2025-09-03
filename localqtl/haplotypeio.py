@@ -235,6 +235,7 @@ class InputGeneratorCis:
     loci_df     : DataFrame with index hap_id and columns ['chrom','pos'] in row order matching haplotypes
     group_s     : optional pd.Series mapping phenotype_id -> group_id
     window      : cis window size
+    on_the_fly_impute : optional bool to impute haplotypes (default: True). If FLARE set to False.
 
     Generates (ungrouped)
     --------------------
@@ -253,6 +254,7 @@ class InputGeneratorCis:
         group_s: Optional[pd.Series] = None,
         window: int = 1_000_000,
         require_both: bool = True,
+        on_the_fly_impute: bool = True,
     ):
         # Store
         self.genotype_df = genotype_df
@@ -262,6 +264,7 @@ class InputGeneratorCis:
         self.loci_df = loci_df.copy()
         self.loci_df['index'] = np.arange(self.loci_df.shape[0])
         self.haplotypes = haplotypes  # Keep Zarr array
+        self.on_the_fly_impute = on_the_fly_impute
 
         self.phenotype_df = phenotype_df
         self.phenotype_pos_df = phenotype_pos_df.copy()
@@ -495,8 +498,11 @@ class InputGeneratorCis:
                 H = None
                 if v_lb is not None and v_ub is not None:
                     H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
-                    H_block = H_slice.compute()
-                    H = self._interpolate_block(H_block)
+                    if self.on_the_fly_impute:
+                        H_block = H_slice.compute()
+                        H = self._interpolate_block(H_block)
+                    else:
+                        H = H_slice.compute() # for FLARE input
 
                 yield p, G, G_idx, H, pid
         else:

@@ -28,7 +28,8 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
                 paired_covariate_df=None, maf_threshold=0, interaction_df=None,
                 maf_threshold_interaction=0.05, group_s=None, window=1_000_000,
                 run_eigenmt=False, logp=False, output_dir='.', write_top=True,
-                write_stats=True, require_both=True, logger=None, verbose=True):
+                write_stats=True, require_both=True, on_the_fly_impute=True,
+                logger=None, verbose=True):
     """
     cis-QTL mapping: nominal associations for all variant-phenotype pairs
 
@@ -60,7 +61,8 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
         loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window, require_both=require_both
+        group_s=group_s, window=window, require_both=require_both,
+        on_the_fly_impute = on_the_fly_impute,
     )
 
     best_assoc = []
@@ -93,7 +95,8 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
             haplotypes=None, loci_df=None, covariates_df=None,
             group_s=None, paired_covariate_df=None, maf_threshold=0,
             beta_approx=True, nperm=10_000, window=1_000_000,
-            random_tiebreak=False, logger=None, seed=None, logp=False,
+            random_tiebreak=False, require_both=True,
+            on_the_fly_impute=True, logger=None, seed=None, logp=False,
             verbose=True, warn_monomorphic=True):
     """Run cis-QTL mapping with permutations (empirical p-values)."""
     # Setup and logging
@@ -125,12 +128,14 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
     )
 
     # Input generator
-    igc = local.InputGeneratorCis(
+    igc = haplotypeio.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        loci_df if loci_df is not None else pd.DataFrame(index=[]),
         haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window
+        loci_df if loci_df is not None else pd.DataFrame(index=[]),
+        group_s=group_s, window=window, require_both=require_both,
+        on_the_fly_impute = on_the_fly_impute,
     )
+
     if igc.n_phenotypes == 0:
         raise ValueError("No valid phenotypes found.")
 
@@ -171,8 +176,9 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
 def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos_df,
                     haplotypes=None, loci_df=None,  covariates_df=None,
                     group_s=None, maf_threshold=0, fdr=0.05, fdr_col='qval',
-                    nperm=10_000, window=1_000_000, missing=-9,
-                    random_tiebreak=False, logger=None, seed=None, logp=False, verbose=True):
+                    nperm=10_000, window=1_000_000, missing=-9, random_tiebreak=False,
+                    require_both=True, on_the_fly_impute=True, logger=None,
+                    seed=None, logp=False, verbose=True):
     """
     Run independent cis-QTL mapping (forward-backward regression)
 
@@ -212,12 +218,14 @@ def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos
     ix_dict = {i:k for k, i in enumerate(genotype_df.index)}
 
     # Input generator
-    igc = local.InputGeneratorCis(
+    igc = haplotypeio.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        loci_df if loci_df is not None else pd.DataFrame(index=[]),
         haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window
+        loci_df if loci_df is not None else pd.DataFrame(index=[]),
+        group_s=group_s, window=window, require_both=require_both,
+        on_the_fly_impute = on_the_fly_impute,
     )
+
     if igc.n_phenotypes == 0:
         raise ValueError('No valid phenotypes found.')
 
