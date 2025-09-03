@@ -24,11 +24,11 @@ from _independent import (
 )
 
 def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
-                haplotype_df=None, loci_df=None, covariates_df=None,
+                haplotypes=None, loci_df=None, covariates_df=None,
                 paired_covariate_df=None, maf_threshold=0, interaction_df=None,
                 maf_threshold_interaction=0.05, group_s=None, window=1_000_000,
                 run_eigenmt=False, logp=False, output_dir='.', write_top=True,
-                write_stats=True, logger=None, verbose=True):
+                write_stats=True, require_both=True, logger=None, verbose=True):
     """
     cis-QTL mapping: nominal associations for all variant-phenotype pairs
 
@@ -52,15 +52,15 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
     sample_ids = phenotype_df.columns.tolist()
 
     _log_mapping_context(
-        genotype_df, haplotype_df, group_s, window,
+        genotype_df, haplotypes, group_s, window,
         None, mapping_state["logger"]
     )
 
     igc = haplotypeio.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        haplotype_df if haplotype_df is not None else pd.DataFrame(index=[]),
+        haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
         loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window
+        group_s=group_s, window=window, require_both
     )
 
     best_assoc = []
@@ -90,7 +90,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
 
 
 def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-            haplotype_df=None, loci_df=None, covariates_df=None,
+            haplotypes=None, loci_df=None, covariates_df=None,
             group_s=None, paired_covariate_df=None, maf_threshold=0,
             beta_approx=True, nperm=10_000, window=1_000_000,
             random_tiebreak=False, logger=None, seed=None, logp=False,
@@ -111,7 +111,7 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
     device = mapping_state["device"]
 
     _log_mapping_context(
-        genotype_df, haplotype_df, group_s, window,
+        genotype_df, haplotypes, group_s, window,
         random_tiebreak, mapping_state["logger"]
     )
 
@@ -128,7 +128,7 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
     igc = local.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        haplotype_df if haplotype_df is not None else pd.DataFrame(index=[]),
+        haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
         group_s=group_s, window=window
     )
     if igc.n_phenotypes == 0:
@@ -169,7 +169,7 @@ def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,
 
 
 def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos_df,
-                    haplotype_df=None, loci_df=None,  covariates_df=None,
+                    haplotypes=None, loci_df=None,  covariates_df=None,
                     group_s=None, maf_threshold=0, fdr=0.05, fdr_col='qval',
                     nperm=10_000, window=1_000_000, missing=-9,
                     random_tiebreak=False, logger=None, seed=None, logp=False, verbose=True):
@@ -195,7 +195,7 @@ def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos
     signif_threshold = signif_df['pval_beta'].max()
 
     _log_mapping_context(
-        genotype_df, haplotype_df, group_s, window,
+        genotype_df, haplotypes, group_s, window,
         random_tiebreak, mapping_state["logger"]
     )
 
@@ -215,7 +215,7 @@ def map_independent(genotype_df, variant_df, cis_df, phenotype_df, phenotype_pos
     igc = local.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        haplotype_df if haplotype_df is not None else pd.DataFrame(index=[]),
+        haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
         group_s=group_s, window=window
     )
     if igc.n_phenotypes == 0:

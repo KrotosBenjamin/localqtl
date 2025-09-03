@@ -114,7 +114,7 @@ def _process_phenotype_window(
         - result_dict: dictionary of results (same structure as chr_res block)
         - top_hit: Series with top association (or None)
     """
-    phenotypes, genotypes, g_idx, haplotypes, _, phenotype_ids = row
+    phenotypes, genotypes, g_idx, haplotypes, phenotype_ids = row
 
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
@@ -207,7 +207,7 @@ def _process_grouped_phenotype_window(
         - result_dict: dictionary of results (same structure as chr_res block)
         - top_hit: Series with top association (or None)
     """
-    phenotypes, genotypes, g_idx, haplotypes, _, phenotype_ids, group_id = row
+    phenotypes, genotypes, g_idx, haplotypes, phenotype_ids, group_id = row
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
     start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_ids[0]]

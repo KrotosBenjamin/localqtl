@@ -263,8 +263,8 @@ def _count_pairs_for_chromosome(igc, chrom, group_s):
     for pid in pids:
         ## Might want to change igc.cis_ranges from dict to variant only
         r = igc.cis_ranges[pid]
-        if r["variants"] is not None:
-            start, end = r["variants"]
+        if r is not None:
+            start, end = r
             n += end - start + 1
     return n
 
@@ -283,10 +283,10 @@ def _prepare_window(row, genotype_ix_t, variant_df, igc, maf_threshold,
                     device=None, logger=None, warn_monomorphic=True,
                     is_group=False, is_perm=False):
     if not is_group:
-        phenotype, genotypes, g_idx, haplotypes, _, phenotype_id = row
+        phenotype, genotypes, g_idx, haplotypes, phenotype_id = row
         group_id = None
     else:
-        phenotypes, genotypes, g_idx, haplotypes, _, phenotype_ids, group_id = row
+        phenotypes, genotypes, g_idx, haplotypes, phenotype_ids, group_id = row
         phenotype_id = phenotype_ids[0]
 
     # Prepare tensors
