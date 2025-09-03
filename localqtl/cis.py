@@ -60,7 +60,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,
         haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
         loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window, require_both
+        group_s=group_s, window=window, require_both=require_both
     )
 
     best_assoc = []
