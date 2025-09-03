@@ -34,7 +34,7 @@ def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device):
             if n_anc == 2:
                 haplotypes_t = haplotypes_arr[:, :, 0]
             else:
-                haplotypes_t = haplotypes_arr.reshape(n_variants, -1)
+                haplotypes_t = haplotypes_arr.reshape(n_var, -1)
         else:
             raise ValueError(f"Unexpected haplotype tensor shape {haplotypes_arr.shape}")
 
