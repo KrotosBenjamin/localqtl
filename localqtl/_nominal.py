@@ -72,7 +72,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
     for row in igc.generate_data(chrom=chrom, verbose=verbose):
         process_fnc = _process_grouped_phenotype_window if group_s is not None else _process_phenotype_window
         results = process_fnc(
-            row, genotype_ix_t, variant_df, phenotype_pos_df,
+            row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
             covariates_df, residualizer, paired_covs, interaction_t,
             maf_threshold, interaction_df, maf_threshold_interaction,
             run_eigenmt, device
@@ -102,7 +102,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
 
 
 def _process_phenotype_window(
-        row, genotype_ix_t, variant_df, phenotype_pos_df,
+        row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
         covariates_df, residualizer, paired_covs_df, interaction_t,
         maf_threshold, interaction_df, maf_threshold_interaction,
         run_eigenmt, device):
@@ -194,7 +194,7 @@ def _process_phenotype_window(
 
 
 def _process_grouped_phenotype_window(
-        row, genotype_ix_t, variant_df, phenotype_pos_df,
+        row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
         covariates_df, residualizer, paired_covs_df, interaction_t,
         maf_threshold, interaction_df, maf_threshold_interaction,
         run_eigenmt, device
