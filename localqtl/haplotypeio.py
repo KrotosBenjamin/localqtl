@@ -126,7 +126,6 @@ class RFMixReader:
         # Dimensions
         self.n_samples = int(self.admix.shape[1])
         self.n_pops = int(self.admix.shape[2])
-        self.variant_ids = variant_df.index.to_numpy()
 
         # Build hap tables
         if self.n_pops == 2:
