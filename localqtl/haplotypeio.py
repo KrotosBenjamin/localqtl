@@ -460,8 +460,8 @@ class InputGeneratorCis:
     # ----------------------------
     @background(max_prefetch=6)
     def generate_data(
-        self, chrom: Optional[str] = None,
-        verbose: bool = False, as_cupy: bool = True,
+        self, chrom: Optional[str] = None, verbose: bool = False,
+        as_cupy: bool = True, debug: bool = False,
     ):
         """
         Yield batches for cis mapping with on-the-fly haplotype imputation.
@@ -511,7 +511,8 @@ class InputGeneratorCis:
                     else:
                         H = H_slice.compute() # for FLARE input
 
-                print(f"[DEBUG] H.shape = {H.shape} | v_lb = {v_lb}, v_ub = {v_ub}")
+                if debug:
+                    print(f"[DEBUG] H.shape = {H.shape} | v_lb = {v_lb}, v_ub = {v_ub}")
                 yield p, G, G_idx, H, pid
         else:
             # Grouped mode: all phenotypes in group must share ranges or we take union
@@ -631,3 +632,45 @@ def _print_progress(k: int, n: int, entity: str) -> None:
         # filtered = variant_loci.loc[present_mask].copy().drop(["i", "_merge"],
         #                                                       axis=1).reset_index(drop=True)
         # self.loci = cudf.from_pandas(filtered)
+
+def _interpolate_block(block) -> "np.ndarray":
+    if 'cupy' in str(type(block)):
+        mod = cp
+    else:
+        mod = np
+
+    block_imputed = block.copy()
+    loci_dim, sample_dim, ancestry_dim = block.shape
+
+    for s in range(sample_dim):
+        for a in range(ancestry_dim):
+            col = block[:, s, a]
+            mask = mod.isnan(col)
+            if mod.any(mask):
+                idx = mod.arange(loci_dim)
+                valid = ~mask
+                if mod.any(valid):
+                    # Linear interpolation and rounding
+                    interpolated = mod.round(
+                        mod.interp(idx[mask], idx[valid], col[valid])
+                    )
+                    col[mask] = interpolated.astype(int)
+            block_imputed[:, s, a] = col
+    return block_imputed
+
+def _slice_rows(arr, lb: Optional[int], ub: Optional[int]):
+    """Row slice from DF/cuDF/Zarr/NumPy."""
+    if lb is None or ub is None or lb < 0 or ub <= lb:
+        return None
+    if isinstance(arr, (pd.DataFrame, cuDF)):
+        return arr.iloc[lb:ub].to_numpy()
+    if isinstance(arr, (zarr.Array, np.ndarray)):
+        return np.asarray(arr[lb:ub])
+    return TypeError(f"Unsupported haplotype type: {type(arr)}")
+
+def _row(arr, i: int):
+    if isinstance(arr, (pd.DataFrame, cuDF)):
+        return arr.iloc[i].to_numpy()
+    if isinstance(arr, (zarr.Array, np.ndarray)):
+        return np.asarray(arr[i])
+    raise TypeError(f"Unsupported haplotype type: {type(arr)}")

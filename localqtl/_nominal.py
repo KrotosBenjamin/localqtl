@@ -15,6 +15,7 @@ from utils import (
     _prepare_tensor,
     _init_result_dict,
     _apply_maf_filters,
+    _unpack_hap_effects,
     _prepare_window_tensors,
     _count_pairs_for_chromosome
 )
@@ -147,18 +148,20 @@ def _process_phenotype_window(
                                    iresidualizer, interaction_df, interaction_t,
                                    variant_ids, device)
     if interaction_df is None:
-        tstat, slope, slope_se, af, ma_samples, ma_count = results
+        tstat, beta_g, se_g, beta_h, se_h, af, ma_samples, ma_count = results
         result = dict(
             phenotype_id=[phenotype_id] * len(variant_ids),
             variant_id=variant_ids,
             start_distance=start_dist,
             af=af, ma_samples=ma_samples, ma_count=ma_count,
-            pval_nominal=tstat, slope=slope, slope_se=slope_se
+            pval_nominal=tstat, beta_g=beta_g, se_g=se_g,
+            **_unpack_hap_effects(beta_h, se_h)
         )
         if end_dist is not None:
             result['end_distance'] = end_dist
         return len(variant_ids), result, None
     else:
+        #TODO fix interaction model
         tstat, b, b_se, af, ma_samples, ma_count = results
         ni = interaction_df.shape[1]
         result = dict(

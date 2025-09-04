@@ -15,6 +15,14 @@ from core import (
     filter_maf_interaction
 )
 
+def _unpack_hap_effects(beta_h, se_h, prefix="beta_h", se_prefix="se_h"):
+    k = beta_h.shape[1]
+    return {
+        **{f"{prefix}_{i}": beta_h[:, i] for i in range(k)},
+        **{f"{se_prefix}_{i}": se_h[:, i] for i in range(k)},
+    }
+
+
 def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device, mode="flatten"):
     """Prepare genotype/haplotype tensors and impute missing."""
     genotypes_t = _prepare_tensor(genotypes, device=device)[:, genotype_ix_t]
@@ -58,7 +66,7 @@ def _log_mapping_context(genotype_df, haplotype_df, group_s, window,
         logger.write("  * including haplotype/ancestry tracks")
     if random_tiebreak:
         logger.write("  * randomly selecting top variant in case of ties")
-    logger.write(f"  * cis-window: ±{window:,}")
+    logger.write(f"  * cis-window: +/-{window:,}")
 
 
 def _filter_monomorphic(genotypes_t, haplotypes_t, g_idx, warn, logger):
@@ -227,33 +235,43 @@ def _setup_mapping_inputs(
     }
 
 
-def _init_result_dict(n, interaction_df, phenotype_pos_df):
+def _init_result_dict(n, interaction_df, phenotype_pos_df, k: int = 1):
     chr_res = OrderedDict()
     chr_res['phenotype_id'] = []
     chr_res['variant_id'] = []
     chr_res['start_distance'] = np.empty(n, dtype=np.int32)
+
     if 'pos' not in phenotype_pos_df:
         chr_res['end_distance'] = np.empty(n, dtype=np.int32)
+
     chr_res['af'] = np.empty(n, dtype=np.float32)
     chr_res['ma_samples'] = np.empty(n, dtype=np.int32)
     chr_res['ma_count'] = np.empty(n, dtype=np.int32)
 
     if interaction_df is None:
         chr_res['pval_nominal'] = np.empty(n, dtype=np.float64)
-        chr_res['slope'] = np.empty(n, dtype=np.float32)
-        chr_res['slope_se'] = np.empty(n, dtype=np.float32)
+        chr_res['beta_g'] = np.empty(n, dtype=np.float32)
+        chr_res['se_g'] = np.empty(n, dtype=np.float32)
+
+        # Add k haplotypes beta/se columns
+        for i in range(k):
+            chr_res[f'beta_h_{i}'] = np.empty(n, dtype=np.float32)
+            chr_res[f'se_h_{i}'] = np.empty(n, dtype=np.float32)
     else:
         if interaction_df is not None and isinstance(interaction_df, pd.DataFrame):
             ni = interaction_df.shape[1]
         chr_res['pval_g'] = np.empty(n, dtype=np.float64)
         chr_res['b_g'] = np.empty(n, dtype=np.float32)
         chr_res['b_g_se'] = np.empty(n, dtype=np.float32)
+
         chr_res['pval_i'] = np.empty([n, ni], dtype=np.float64)
         chr_res['b_i'] = np.empty([n, ni], dtype=np.float32)
         chr_res['b_i_se'] = np.empty([n, ni], dtype=np.float32)
+
         chr_res['pval_gi'] = np.empty([n, ni], dtype=np.float64)
         chr_res['b_gi'] = np.empty([n, ni], dtype=np.float32)
         chr_res['b_gi_se'] = np.empty([n, ni], dtype=np.float32)
+
     return chr_res
 
 
