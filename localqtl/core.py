@@ -205,7 +205,10 @@ def calculate_corr(X_t, Y_t, residualizer=None, return_var=False):
         return cor_t.squeeze(1)
 
 
-def calculate_corr_paired(G_t, H_t, Y_t, residualizer=None, return_se_h=False, use_pinv=False):
+def calculate_corr_paired(
+        G_t, H_t, Y_t, residualizer=None,
+        return_se_h=False, use_pinv=False
+):
     """
     Batched regression: Y ~ g + h (paired haplotypes for each variant).
 
@@ -238,11 +241,13 @@ def calculate_corr_paired(G_t, H_t, Y_t, residualizer=None, return_se_h=False, u
         assert Y_t.dim() == 2 and Y_t.shape[0] == 1, "Y_t must be (1, n_samples)"
         assert G_t.shape[1] == Y_t.shape[1], "Sample count mismatch between G_t and Y_t"
 
+        n_variants, n_samples = G_t.shape
+        
         if H_t.ndim == 2:
             H_t = H_t.unsqueeze(2)  # (n_variants x n_samples) -> (n_variants x n_samples x 1)
-            n_variants, n_samples, k = H_t.shape
         elif H_t.ndim != 3:
             raise ValueError(f"H_t must be 2D or 3D, got shape {H_t.shape}")
+        _, _, k = H_t.shape
 
         assert H_t.shape[0] == G_t.shape[0], "Variant count mismatch between G_t and H_t"
         assert H_t.shape[1] == G_t.shape[1], "Sample count mismatch between G_t and H_t"
@@ -251,50 +256,59 @@ def calculate_corr_paired(G_t, H_t, Y_t, residualizer=None, return_se_h=False, u
         if residualizer is not None:
             G_t = residualizer.transform(G_t)
             Y_t = residualizer.transform(Y_t)
-            H_t = torch.stack([residualizer.transform(H_t[i].T) for i in range(H_t.shape[0])], dim=0)
-            H_t = H_t.reshape(n_variants, k, n_samples).permute(0, 2, 1)
+            H_t = torch.stack(
+                [residualizer.transform(H_t[i].T) for i in range(H_t.shape[0])],
+                dim=0
+            ).reshape(n_variants, n_samples, k)
 
         # Build design matrix X
-        ones = torch.ones((n_variants, n_samples, 1), device=G_t.device, dtype=G_t.dtype)
-        g = G_t.unsqueeze(-1)                  # (n_variants x n_samples x 1)
-        h = H_t                                # (n_variants x n_samples x k)
-        X = torch.cat([ones, g, h], dim=2)     # (n_variants x n_samples x (1 + 1 + k))
+        ones = torch.ones((n_variants, n_samples, 1),
+                          device=G_t.device, dtype=G_t.dtype)
+        g = G_t.unsqueeze(-1)               # (n_variants x n_samples x 1)
+        h = H_t                             # (n_variants x n_samples x k)
+        X = torch.cat([ones, g, h], dim=2)  # (n_variants x n_samples x (1 + 1 + k))
         p = X.shape[2]
 
         # Repeat phenotype for each variant
         Y_rep = Y_t.repeat(n_variants, 1, 1).transpose(1, 2)  # (n_variants x n_samples x 1)
 
-        # Solve normal equations
-        XtX = torch.matmul(X.transpose(1, 2), X)      # (n_variants x p x p)
-        XtY = torch.matmul(X.transpose(1, 2), Y_rep)  # (n_variants x p x 1)
-
-        if use_pinv:
-            XtX_inv = torch.linalg.pinv(XtX)          # robust to singular matrices
-            beta = torch.matmul(XtX_inv, XtY).squeeze(-1)
+        # Regression solve
+        if hasattr(torch.linalg, "lstsq"):
+            # PyTorch (>2.0)
+            sol = torch.linalg.lstsq(X, Y_rep)
+            beta = sol.solution.squeeze(-1) # (n_variants x p)
+            resid = (Y_rep - X @ beta.unsqueeze(-1)).squeeze(-1)
         else:
-            try:
-                beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
-            except RuntimeError as e:
-                raise RuntimeError("Singular matrix in torch.linalg.solve; try `use_pinv=True`.") from e
-
-        # Predictions and residuals
-        yhat = torch.matmul(X, beta.unsqueeze(-1)).squeeze(-1)         # (n_variants x n_samples)
-        resid = Y_rep.squeeze(-1) - yhat                               # (n_variants x n_samples)
-
+            # Normal equations fallback (Cholesky)
+            XtX = torch.matmul(X.transpose(1, 2), X)      # (n_variants x p x p)
+            XtY = torch.matmul(X.transpose(1, 2), Y_rep)  # (n_variants x p x 1)
+            if use_pinv:
+                XtX_inv = torch.linalg.pinv(XtX)          # robust to singular matrices
+                beta = torch.matmul(XtX_inv, XtY).squeeze(-1)
+            else:
+                L = torch.linalg.cholesky(XtX)
+                beta = torch.cholesky(XtY, L).squeeze(-1)
+            resid = (Y_rep.squeeze(-1) - (X @ beta.unsqueeze(-1)).squeeze(-1))
+        
         # Degrees of freedom
         if residualizer is not None and hasattr(residualizer, "dof"):
             dof = float(residualizer.dof)
         else:
             dof = float(n_samples - p)
 
-        rss = torch.sum(resid**2, dim=1)                               # (n_variants,)
-        sigma2 = rss / dof                                             # (n_variants,)
+        # Residual variance
+        rss = torch.sum(resid**2, dim=1)                   # (n_variants,)
+        sigma2 = rss / dof                                 # (n_variants,)
 
-        var_beta = sigma2.view(-1, 1, 1) * XtX_inv if use_pinv else sigma2.view(-1, 1, 1) * torch.linalg.inv(XtX)
-        se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2))      # (n_variants x p)
+        # Variance-covariance of beta
+        if hasattr(torch.linalg, "lstsq"):
+            # Recompute XtX for variance (cheap, p small)
+            XtX = torch.matmul(X.transpose(1, 2), X)
+        var_beta = sigma2.view(-1, 1, 1) * torch.linalg.inv(XtX)
+        se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2)) # (n_variants x p)
 
         # Extract results
-        beta_g = beta[:, 1]                   # genotype coefficient
+        beta_g = beta[:, 1]                                # genotype coefficient
         beta_h = beta[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
         se_g   = se[:, 1]
         tstat_g = beta_g / se_g.clamp(min=1e-8)

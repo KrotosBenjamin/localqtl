@@ -51,7 +51,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
     phenotype_pos_df = mapping_state["phenotype_pos_df"]
     group_s = mapping_state["group_s"]
     sample_ids = phenotype_df.columns.tolist()
-
+    
     _log_mapping_context(
         genotype_df, haplotypes, group_s, window,
         None, mapping_state["logger"]
