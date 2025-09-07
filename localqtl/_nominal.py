@@ -90,7 +90,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
             best_assoc.append(top_hit)
         start += n_i
 
-        del row, results, chr_block
+        del batch_rows, results, chr_block
         if device == "cuda":
             torch.cuda.empty_cache()
 
