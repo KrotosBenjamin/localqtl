@@ -240,6 +240,24 @@ def calculate_corr_paired(
     """
     Batched regression: Y ~ g + h (paired haplotypes for each variant).
     Vectorized closed-form implementation.
+
+    Parameters:
+    ----------
+    G_t: Tensor of shape (n_variants, n_samples), genotypes.
+    H_t: Tensor of shape (n_variants, n_samples, k) or (n_samples, k), haplotypes.
+    Y_t: Tensor of shape (1, n_samples) or (n_variants, n_samples), phenotypes.
+    residualizer: Optional residualizer with `.transform()` and optional `.dof`.
+    use_pinv: Use pseudo-inverse instead of solve for XtX.
+    return_se_h: If True, return standard error for haplotype effects.
+    dof_vector: Optional tensor of shape (n_variants,) for degrees of freedom.
+
+    Returns:
+    -------
+    beta_g: Estimated genotype coefficients.
+    beta_h: Estimated haplotype coefficients.
+    tstat_g: t-statistics for genotype.
+    se_g: Standard error of genotype coefficient.
+    se_h: Standard error of haplotype coefficients (if return_se_h is True).
     """
     with torch.no_grad():
         n_variants, n_samples = G_t.shape
@@ -276,10 +294,10 @@ def calculate_corr_paired(
         # Assemble XtX per variant
         XtX = torch.zeros((n_variants, 2 + k, 2 + k),
                           device=G_t.device, dtype=G_t.dtype)
-        XtX[:, 0, 0] = n_samples
-        XtX[:, 0, 1] = sum_g
-        XtX[:, 1, 0] = sum_g
-        XtX[:, 1, 1] = sum_g2
+        XtX[:, :2, :2] = torch.stack([
+            torch.stack([torch.full_like(sum_g, n_samples), sum_g], dim=1),
+            torch.stack([sum_g, sum_g2], dim=1)
+        ], dim=1)
         XtX[:, 0, 2:] = sum_h
         XtX[:, 2:, 0] = sum_h
         XtX[:, 1, 2:] = sum_gh
@@ -291,7 +309,7 @@ def calculate_corr_paired(
             y = Y_t.squeeze(0)                   # (n_samples,)
             sum_y = y.sum().expand(n_variants)   # scalar repeated
             sum_gy = (G_t * y).sum(1)
-            sum_hy = torch.einsum("vs,vsk->vk", y.expand_as(G_t), H_t)
+            sum_hy = torch.einsum("vs,vsk->vk", y, H_t)
         elif Y_t.shape[0] == n_variants:
             sum_y = Y_t.sum(1)
             sum_gy = (G_t * Y_t).sum(1)
@@ -310,20 +328,13 @@ def calculate_corr_paired(
         else:
             beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
             
-        # Residuals
-        yhat = (
-            beta[:, 0:1] * n_samples +
-            beta[:, 1:2] * sum_g +
-            (beta[:, 2:] * sum_h).sum(1, keepdim=True)
-        )
-
         # RSS
         if Y_t.shape[0] == 1:
             y2 = (y**2).sum()
-            rss = y2 - (beta.unsqueeze(1) @ XtY).squeeze()
+            rss = y2 - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
         else:
             y2 = (Y_t**2).sum(1)
-            rss = y2 - (beta.unsqueeze(1) @ XtY).squeeze()
+            rss = y2 - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
         
         # Degrees of freedom
         p = 2 + k
@@ -333,8 +344,7 @@ def calculate_corr_paired(
             dof = torch.full((n_variants,), float(residualizer.dof),
                              device=G_t.device)
         else:
-            dof = torch.full((n_variants,), float(n_samples - p),
-                             device=G_t.device)
+            dof = G_t.new_full((n_variants,), n_samples - p)
 
         # Residual variance
         sigma2 = rss / dof
