@@ -127,10 +127,10 @@ def precompute_allele_stats(genotype_df, device="cpu"):
     Precompute allele frequencies, MAF, minor allele counts, and sample counts
     for all variants genome-wide.
     """
-    genotypes_all_t = _prepare_tensor(genotype_df.values.T, device=device)
+    genotypes_all_t = _prepare_tensor(genotype_df.values, device=device)
 
     n2 = 2 * genotypes_all_t.shape[1]
-    af_all_t = genotypes_all_t.sum(1) / n2                # allele frequency
+    af_all_t = genotypes_all_t.sum(1) / n2
     maf_all_t = torch.where(af_all_t > 0.5, 1 - af_all_t, af_all_t)
 
     # Minor allele sample counts
@@ -145,12 +145,12 @@ def precompute_allele_stats(genotype_df, device="cpu"):
     ma_count_t = torch.where(ix_t, a, n2 - a)
 
     # Move to CPU numpy arrays for fast indexing
-    af_all = af_all_t.cpu().numpy()
-    maf_all = maf_all_t.cpu().numpy()
-    ma_samples_all = ma_samples_t.cpu().numpy()
-    ma_count_all = ma_count_t.cpu().numpy()
-
-    return af_all, maf_all, ma_samples_all, ma_count_all
+    return (
+        af_all_t.cpu().numpy(),
+        maf_all_t.cpu().numpy(),
+        ma_samples_t.cpu().numpy(),
+        ma_count_t.cpu().numpy()
+    )
 
 
 def calculate_maf_precomputed(maf_all, variant_idx):
