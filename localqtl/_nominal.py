@@ -22,6 +22,9 @@ from utils import (
     _count_pairs_for_chromosome
 )
 
+import warnings
+warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*")
+
 # Compile once at import
 calculate_corr_paired_compiled = torch.compile(calculate_corr_paired,
                                                mode="reduce-overhead")
