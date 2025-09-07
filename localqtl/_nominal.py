@@ -118,7 +118,7 @@ def _process_phenotype_window(
     device = mapping_state["device"]
     phenotype, genotypes, g_idx, haplotypes, phenotype_id = row
 
-    variant_idx = np.arange(g_idx[0], g_idx[-1] + 1)
+    variant_idx = g_idx
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
     start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_id]
@@ -217,7 +217,7 @@ def _process_grouped_phenotype_window(
     device = mapping_state["device"]
     phenotypes, genotypes, g_idx, haplotypes, phenotype_ids, group_id = row
 
-    variant_idx = np.arange(g_idx[0], g_idx[-1] + 1)
+    variant_idx = g_idx
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
     start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_ids[0]]
