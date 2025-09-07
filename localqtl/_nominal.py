@@ -174,16 +174,24 @@ def _process_phenotype_window(
             genotype_resid = iresidualizer.transform(genotypes_t)
             phenotype_resid = iresidualizer.transform(phenotype_t.unsqueeze(0)).squeeze(0)
             if haplotypes_t is not None:
-                H_t = haplotypes_t.permute(0, 2, 1).reshape(-1, haplotypes_t.shape[1])
-                H_resid = iresidualizer.transform(H_t).reshape(
-                    haplotypes_t.shape[0], haplotypes_t.shape[2], haplotypes_t.shape[1]
-                ).permute(0, 2, 1)
+                if haplotypes_t.ndim == 2:
+                    H_resid = iresidualizer.transform(haplotypes_t)
+                    H_resid = H_resid.unsqueeze(-1)
+                elif haplotypes_t.ndim == 3:
+                    n_var, n_samp, k = haplotypes_t.shape
+                    H_flat = haplotypes_t.reshape(n_var, n_samp * k)
+                    H_resid = iresidualizer.transform(H_flat).reshape(n_var, n_samp, k)
+                else:
+                    raise ValueError(f"Unexpected haplotypes_t.ndim={haplotypes_t.ndim}")
             else:
                 H_resid = None
         else:
             genotype_resid = genotypes_t
             phenotype_resid = phenotype_t
-            H_resid = haplotypes_t
+            if haplotypes_t is not None and haplotypes_t.ndim == 2:
+                H_resid = haplotypes_t.unsqueeze(-1)
+            else:
+                H_resid = haplotypes_t
 
         # Collect lists
         geno_list.append(genotype_resid)
