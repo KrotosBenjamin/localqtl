@@ -15,6 +15,14 @@ from core import (
 )
 
 def _unpack_hap_effects(beta_h, se_h, prefix="beta_h", se_prefix="se_h"):
+    if beta_h is None or se_h is None:
+        return {}
+    if beta_h.ndim == 1:
+        # Single haplotype covariate (k=1)
+        return {
+            f"{prefix}_0": beta_h,
+            f"{se_prefix}_0": se_h,
+        }
     k = beta_h.shape[1]
     return {
         **{f"{prefix}_{i}": beta_h[:, i] for i in range(k)},
