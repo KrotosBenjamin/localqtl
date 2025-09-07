@@ -22,13 +22,6 @@ from utils import (
     _count_pairs_for_chromosome
 )
 
-import warnings
-warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*")
-
-# Compile once at import
-calculate_corr_paired_compiled = torch.compile(calculate_corr_paired,
-                                               mode="reduce-overhead")
-
 def _run_association(genotypes_t, phenotype_t, haplotypes_t,
                      residualizer, interaction_df, interaction_t,
                      variant_ids, device, dof_vector):
@@ -41,7 +34,7 @@ def _run_association(genotypes_t, phenotype_t, haplotypes_t,
                 haplotypes_t=haplotypes_t,
             )
         else:
-            res = calculate_corr_paired_compiled(
+            res = calculate_corr_paired(
                 genotypes_t, haplotypes_t, phenotype_t,
                 residualizer=None, use_pinv=False,
                 return_se_h=True, dof_vector=dof_vector,
