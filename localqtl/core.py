@@ -238,10 +238,8 @@ def calculate_corr_paired(
         use_pinv=False, dof_vector=None,
 ):
     """
-    Batched regression: Y ~ g + h (paired haplotypes for each variant).
-    Supports:
-      - Y_t: (1, n_samples)          -> same phenotype for all variants
-      - Y_t: (n_variants, n_samples) -> variant-specific phenotypes
+    Batched closed-form regression: Y ~ g + h (paired haplotypes for each
+    variant).
     """
     with torch.no_grad():
         n_variants, n_samples = G_t.shape
@@ -253,7 +251,7 @@ def calculate_corr_paired(
             raise ValueError(f"H_t must be 2D or 3D, got shape {H_t.shape}")
         _, _, k = H_t.shape
 
-        # Residualization
+        # Residualization if needed
         if residualizer is not None:
             G_t = residualizer.transform(G_t)
             Y_t = residualizer.transform(Y_t)
@@ -281,19 +279,17 @@ def calculate_corr_paired(
             )
 
         # Regression solve
-        if hasattr(torch.linalg, "lstsq"): # PyTorch (>2.0)
-            sol = torch.linalg.lstsq(X, Y_rep)
-            beta = sol.solution.squeeze(-1) # (n_variants x p)
-            resid = (Y_rep - X @ beta.unsqueeze(-1)).squeeze(-1)
-        else: # Normal equations fallback
-            XtX = torch.matmul(X.transpose(1, 2), X)      # (n_variants x p x p)
-            XtY = torch.matmul(X.transpose(1, 2), Y_rep)  # (n_variants x p x 1)
-            if use_pinv:
-                XtX_inv = torch.linalg.pinv(XtX)          # robust to singular matrices
-                beta = torch.matmul(XtX_inv, XtY).squeeze(-1)
-            else:
-                beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
-            resid = (Y_rep.squeeze(-1) - (X @ beta.unsqueeze(-1)).squeeze(-1))
+        XtX = torch.matmul(X.transpose(1, 2), X)      # (n_variants x p x p)
+        XtY = torch.matmul(X.transpose(1, 2), Y_rep)  # (n_variants x p x 1)
+        if use_pinv:
+            XtX_inv = torch.linalg.pinv(XtX)          # robust to singular matrices
+            beta = torch.matmul(XtX_inv, XtY).squeeze(-1)
+        else:
+            beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
+
+        # Residuals
+        yhat = torch.matmul(X, beta.unsqueeze(-1)).squeeze(-1)
+        resid = Y_rep.squeeze(-1) - yhat
         
         # Degrees of freedom
         if dof_vector is not None:
@@ -308,9 +304,10 @@ def calculate_corr_paired(
         sigma2 = rss / dof                                 # (n_variants,)
 
         # Variance-covariance of beta
-        if hasattr(torch.linalg, "lstsq"):
-            XtX = torch.matmul(X.transpose(1, 2), X)
-        var_beta = sigma2.view(-1, 1, 1) * torch.linalg.inv(XtX)
+        if use_pinv:
+            var_beta = sigma2.view(-1, 1, 1) * XtX_inv
+        else:
+            var_beta = sigma2.view(-1, 1, 1) * torch.linalg.inv(XtX)
         se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2)) # (n_variants x p)
 
         # Extract results
