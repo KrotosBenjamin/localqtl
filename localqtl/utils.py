@@ -22,6 +22,20 @@ def _unpack_hap_effects(beta_h, se_h, prefix="beta_h", se_prefix="se_h"):
     }
 
 
+def _batch_generator(iterable, batch_size):
+    """
+    Yield items from an iterable in fixed-size batches.
+    """
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:  # leftovers
+        yield batch
+
+
 def _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device, mode="flatten"):
     """Prepare genotype/haplotype tensors and impute missing."""
     genotypes_t = _prepare_tensor(genotypes, device=device)[:, genotype_ix_t]

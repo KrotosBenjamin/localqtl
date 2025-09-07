@@ -13,6 +13,7 @@ from core import (
 from utils import (
     _merge_results,
     _prepare_tensor,
+    _batch_generator,
     _init_result_dict,
     _apply_maf_filters,
     _unpack_hap_effects,
@@ -70,10 +71,11 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
 
     # Iterate windows
-    for row in igc.generate_data(chrom=chrom, verbose=verbose):
+    for batch_rows in _batch_generator(igc.generate_data(chrom=chrom, verbose=verbose),
+                                       batch_size=16):
         process_fnc = _process_grouped_phenotype_window if group_s is not None else _process_phenotype_window
         results = process_fnc(
-            row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
+            batch_rows, igc, genotype_ix_t, variant_df, phenotype_pos_df,
             covariates_df, residualizer, paired_covs, interaction_t,
             maf_threshold, interaction_df, maf_threshold_interaction,
             run_eigenmt, mapping_state
