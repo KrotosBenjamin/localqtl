@@ -92,7 +92,7 @@ def _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist, end_d
             return None
 
         # Torch mask
-        mask_t = torch.as_tensor(mask_np, device=genotypes_t.device)
+        mask_t = torch.as_tensor(mask, device=genotypes_t.device)
         genotypes_t = genotypes_t[mask_t]
         if haplotypes_t is not None:
             haplotypes_t = haplotypes_t[mask_t]
