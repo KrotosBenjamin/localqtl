@@ -121,7 +121,7 @@ def _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist, end_d
         if haplotypes_t is not None:
             haplotypes_t = haplotypes_t[mask_t]
 
-    return genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist
+    return genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx
 
 
 def _filter_significant(phenotype_df, phenotype_pos_df, paired_covariate_df,
