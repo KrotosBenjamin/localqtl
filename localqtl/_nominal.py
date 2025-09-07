@@ -22,6 +22,10 @@ from utils import (
     _count_pairs_for_chromosome
 )
 
+# Compile once at import
+calculate_corr_paired_compiled = torch.compile(calculate_corr_paired,
+                                               mode="reduce-overhead")
+
 def _run_association(genotypes_t, phenotype_t, haplotypes_t,
                      residualizer, interaction_df, interaction_t,
                      variant_ids, device, dof_vector):
@@ -34,7 +38,7 @@ def _run_association(genotypes_t, phenotype_t, haplotypes_t,
                 haplotypes_t=haplotypes_t,
             )
         else:
-            res = calculate_corr_paired(
+            res = calculate_corr_paired_compiled(
                 genotypes_t, haplotypes_t, phenotype_t,
                 residualizer=None, use_pinv=False,
                 return_se_h=True, dof_vector=dof_vector,
@@ -82,7 +86,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
 
     # Iterate windows
     for batch_rows in _batch_generator(igc.generate_data(chrom=chrom, verbose=verbose),
-                                       batch_size=32):
+                                       device=mapping_state["device"]):
         process_fnc = _process_grouped_phenotype_window if group_s is not None else _process_phenotype_window
         results = process_fnc(
             batch_rows, igc, genotype_ix_t, variant_df, phenotype_pos_df,

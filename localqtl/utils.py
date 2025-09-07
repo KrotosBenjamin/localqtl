@@ -30,15 +30,23 @@ def _unpack_hap_effects(beta_h, se_h, prefix="beta_h", se_prefix="se_h"):
     }
 
 
-def _batch_generator(iterable, batch_size):
+def _batch_generator(iterable, start_size=4, max_size=64,
+                     grow_factor=2, shrink_factor=0.5,
+                     device="cuda"):
     """
-    Yield items from an iterable in fixed-size batches.
+    Yield items from an iterable in batches.
     """
+    batch_size = start_size
     batch = []
     for item in iterable:
         batch.append(item)
         if len(batch) == batch_size:
             yield batch
+            if device.startswith("cuda"):
+                batch_size = min(int(batch_size * grow_factor), max_size)
+            else:
+                batch_size = start_size
+
             batch = []
     if batch:  # leftovers
         yield batch
