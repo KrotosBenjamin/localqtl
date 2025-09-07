@@ -42,7 +42,7 @@ def _batch_generator(iterable, start_size=4, max_size=64,
         batch.append(item)
         if len(batch) == batch_size:
             yield batch
-            if device.startswith("cuda"):
+            if str(device).startswith("cuda"):
                 batch_size = min(int(batch_size * grow_factor), max_size)
             else:
                 batch_size = start_size
