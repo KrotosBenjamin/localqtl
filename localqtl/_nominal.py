@@ -7,6 +7,7 @@ import eigenmt
 from core import (
     Residualizer,
     calculate_cis_nominal,
+    calculate_corr_paired,
     calculate_interaction_nominal
 )
 
@@ -40,6 +41,7 @@ def _run_association(genotypes_t, phenotype_t, haplotypes_t,
             )
         return [x.cpu().numpy() for x in res], None
     else:
+        # TODO: batch model
         res = calculate_interaction_nominal(
             genotypes_t, phenotype_t.unsqueeze(0), interaction_t,
             residualizer=residualizer,
