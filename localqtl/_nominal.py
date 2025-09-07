@@ -76,7 +76,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
             row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
             covariates_df, residualizer, paired_covs, interaction_t,
             maf_threshold, interaction_df, maf_threshold_interaction,
-            run_eigenmt, device
+            run_eigenmt, mapping_state
         )
         if results is None:
             continue
@@ -106,7 +106,7 @@ def _process_phenotype_window(
         row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
         covariates_df, residualizer, paired_covs_df, interaction_t,
         maf_threshold, interaction_df, maf_threshold_interaction,
-        run_eigenmt, device):
+        run_eigenmt, mapping_state):
     """
     Process one cis-window for a phenotype (or group of phenotypes).
 
@@ -115,8 +115,10 @@ def _process_phenotype_window(
         - result_dict: dictionary of results (same structure as chr_res block)
         - top_hit: Series with top association (or None)
     """
+    device = mapping_state["device"]
     phenotype, genotypes, g_idx, haplotypes, phenotype_id = row
 
+    variant_idx = np.arange(g_idx[0], g_idx[-1] + 1)
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
     start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_id]
@@ -128,10 +130,10 @@ def _process_phenotype_window(
                                                         genotype_ix_t, device)
     filt = _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist,
                               end_dist, maf_threshold, interaction_df,
-                              maf_threshold_interaction)
+                              maf_threshold_interaction, variant_idx, mapping_state)
     if filt is None:
         return None
-    genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist = filt
+    genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx = filt
 
     # Residualizer (with optional phenotype-specific covariate)
     if paired_covs_df is not None and phenotype_id in paired_covs_df.index:
@@ -148,11 +150,13 @@ def _process_phenotype_window(
                                    iresidualizer, interaction_df, interaction_t,
                                    variant_ids, device)
     if interaction_df is None:
-        tstat, beta_g, se_g, beta_h, se_h, af, ma_samples, ma_count = results
+        tstat, beta_g, se_g, beta_h, se_h = results
+        af = mapping_state["af_all"][variant_idx]
+        ma_samples = mapping_state["ma_samples_all"][variant_idx]
+        ma_count = mapping_state["ma_count_all"][variant_idx]
         result = dict(
             phenotype_id=[phenotype_id] * len(variant_ids),
-            variant_id=variant_ids,
-            start_distance=start_dist,
+            variant_id=variant_ids, start_distance=start_dist,
             af=af, ma_samples=ma_samples, ma_count=ma_count,
             pval_nominal=tstat, beta_g=beta_g, se_g=se_g,
             **_unpack_hap_effects(beta_h, se_h)
@@ -200,7 +204,7 @@ def _process_grouped_phenotype_window(
         row, igc, genotype_ix_t, variant_df, phenotype_pos_df,
         covariates_df, residualizer, paired_covs_df, interaction_t,
         maf_threshold, interaction_df, maf_threshold_interaction,
-        run_eigenmt, device
+        run_eigenmt, mapping_state
 ):
     """
     Process one cis-window for a group of phenotypes (group_s is not None).
@@ -210,7 +214,10 @@ def _process_grouped_phenotype_window(
         - result_dict: dictionary of results (same structure as chr_res block)
         - top_hit: Series with top association (or None)
     """
+    device = mapping_state["device"]
     phenotypes, genotypes, g_idx, haplotypes, phenotype_ids, group_id = row
+
+    variant_idx = np.arange(g_idx[0], g_idx[-1] + 1)
     variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
     variant_pos = variant_df['pos'].to_numpy(copy=False)
     start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_ids[0]]
@@ -222,10 +229,10 @@ def _process_grouped_phenotype_window(
                                                         genotype_ix_t, device)
     filt = _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist,
                               end_dist, maf_threshold, interaction_df,
-                              maf_threshold_interaction)
+                              maf_threshold_interaction, variant_idx, mapping_state)
     if filt is None:
         return None
-    genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist = filt
+    genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx = filt
 
     # Run for first phenotype
     phenotype_t = _prepare_tensor(phenotypes[0], device=device)
@@ -234,7 +241,10 @@ def _process_grouped_phenotype_window(
                                   variant_ids, device)
 
     if interaction_df is None:
-        tstat, slope, slope_se, af, ma_samples, ma_count = results
+        tstat, beta_g, se_g, beta_h, se_h = results
+        af = mapping_state["af_all"][variant_idx]
+        ma_samples = mapping_state["ma_samples_all"][variant_idx]
+        ma_count = mapping_state["ma_count_all"][variant_idx]
     else:
         tstat, b, b_se, af, ma_samples, ma_count = results
 

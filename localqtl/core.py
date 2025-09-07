@@ -122,6 +122,55 @@ def center_normalize(M_t: torch.Tensor, dim: int=0) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 # Allele frequency and filtering utilities
 # -----------------------------------------------------------------------------
+def precompute_allele_stats(genotype_df, device="cpu"):
+    """
+    Precompute allele frequencies, MAF, minor allele counts, and sample counts
+    for all variants genome-wide.
+    """
+    genotypes_all_t = _prepare_tensor(genotype_df.values.T, device=device)
+
+    n2 = 2 * genotypes_all_t.shape[1]
+    af_all_t = genotypes_all_t.sum(1) / n2                # allele frequency
+    maf_all_t = torch.where(af_all_t > 0.5, 1 - af_all_t, af_all_t)
+
+    # Minor allele sample counts
+    ix_t = af_all_t <= 0.5
+    m = genotypes_all_t > 0.5
+    a = m.sum(1).int()
+    b = (genotypes_all_t < 1.5).sum(1).int()
+    ma_samples_t = torch.where(ix_t, a, b)
+
+    # Minor allele total counts
+    a = (genotypes_all_t * m.float()).sum(1).int()
+    ma_count_t = torch.where(ix_t, a, n2 - a)
+
+    # Move to CPU numpy arrays for fast indexing
+    af_all = af_all_t.cpu().numpy()
+    maf_all = maf_all_t.cpu().numpy()
+    ma_samples_all = ma_samples_t.cpu().numpy()
+    ma_count_all = ma_count_t.cpu().numpy()
+
+    return af_all, maf_all, ma_samples_all, ma_count_all
+
+
+def calculate_maf_precomputed(maf_all, variant_idx):
+    """
+    Retrieve MAF values for a set of variants using precomputed array.
+    """
+    return maf_all[variant_idx]
+
+
+def get_allele_stats_precomputed(af_all, ma_samples_all, ma_count_all, variant_idx):
+    """
+    Retrieve allele frequency stats for a set of variants using precomputed arrays.
+    """
+    return (
+        af_all[variant_idx],
+        ma_samples_all[variant_idx],
+        ma_count_all[variant_idx],
+    )
+
+
 def calculate_maf(genotype_t: torch.Tensor, alleles: int=2):
     """Calculate minor allele frequency"""
     af_t = genotype_t.sum(1) / (alleles * genotype_t.shape[1])
@@ -337,30 +386,10 @@ def get_t_pval(t, df, log=False):
 # Regression, filtering, and covariates
 # -----------------------------------------------------------------------------
 def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
-                          haplotypes_t=None, return_af=True):
+                          haplotypes_t=None):
     """
     Compute nominal cis-association statistics: Y ~ G + H + covariates,
     using chunked memory-efficient processing.
-
-    Parameters:
-    -----------
-    genotypes_t: torch.Tensor
-        (num_variants x num_samples)
-    phenotype_t: torch.Tensor
-        (num_samples,) or (1 x num_samples)
-    residualizer: Residualizer
-        Covariate regressor object
-    haplotypes_t: torch.Tensor or None
-        (num_haplotypes x num_samples), optional
-    return_af: bool
-        Whether to return allele frequency stats for genotypes
-
-    Returns:
-    --------
-    tstat_t: tensor
-    slope_t: tensor
-    slope_se_t: tensor
-    (optional) af_t, ma_samples_t, ma_count_t
     """
     # Ensure phenotypes is 2D and float32
     phenotype_t = phenotype_t.view(1, -1).float()
@@ -383,12 +412,10 @@ def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
             genotypes_t, haplotypes_t, phenotype_t, residualizer=residualizer,
             return_se_h=True, use_pinv=True) # Turn off to increase speed
 
-    if not return_af:
-        return tstat_g, beta_g, se_g, beta_h, se_h
-
-    # Allele frequency stats for variants only
-    af_t, ma_samples_t, ma_count_t = get_allele_stats(genotypes_t)
-    return tstat_g, beta_g, se_g, beta_h, se_h, af_t, ma_samples_t, ma_count_t
+    return tstat_g, beta_g, se_g, beta_h, se_h
+    ## Allele frequency stats for variants only
+    #af_t, ma_samples_t, ma_count_t = get_allele_stats(genotypes_t)
+    # return tstat_g, beta_g, se_g, beta_h, se_h#, af_t, ma_samples_t, ma_count_t
 
 
 def calculate_cis_permutations(genotypes_t, phenotype_t, permutation_ix_t,

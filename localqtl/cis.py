@@ -10,9 +10,10 @@ from utils import (
     _log_mapping_context,
     _setup_mapping_inputs,
     _write_chromosome_results,
-    _summarize_top_associations
+    _summarize_top_associations,
 )
 from _nominal import _map_chromosome
+from core import precompute_allele_stats
 from _permutation import (
     _make_permutation_index,
     _process_permutation_window,
@@ -56,6 +57,13 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         genotype_df, haplotypes, group_s, window,
         None, mapping_state["logger"]
     )
+    # Add precomputed allele stats
+    af_all, maf_all, ma_samples_all, ma_count_all = \
+        precompute_allele_stats(genotype_df, device=mapping_state["device"])
+    mapping_state.update({
+        "af_all": af_all, "maf_all": maf_all,
+        "ma_samples_all": ma_samples_all, "ma_count_all": ma_count_all
+    })
 
     igc = haplotypeio.InputGeneratorCis(
         genotype_df, variant_df, phenotype_df, phenotype_pos_df,

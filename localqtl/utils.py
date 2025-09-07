@@ -11,7 +11,6 @@ from core import (
     impute_mean,
     Residualizer,
     SimpleLogger,
-    calculate_maf,
     filter_maf_interaction
 )
 
@@ -81,24 +80,32 @@ def _filter_monomorphic(genotypes_t, haplotypes_t, g_idx, warn, logger):
 
 
 def _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist,
-                       maf_threshold, interaction_df, maf_threshold_interaction):
+                       maf_threshold, interaction_df, maf_threshold_interaction,
+                       variant_idx, mapping_state):
     """Apply standard and interaction MAF filters, returning filtered tensors and arrays."""
     # Standard MAF filter
     if maf_threshold > 0:
-        maf_t = calculate_maf(genotypes_t)
-        mask_t = maf_t >= maf_threshold
-        if mask_t.sum() == 0:
+        # CPU mask
+        maf = mapping_state["maf_all"][variant_idx]
+        mask = maf >= maf_threshold
+        if mask.sum() == 0:
             return None
+
+        # Torch mask
+        mask_t = torch.as_tensor(mask_np, device=genotypes_t.device)
         genotypes_t = genotypes_t[mask_t]
-        mask = mask_t.cpu().numpy().astype(bool)
+        if haplotypes_t is not None:
+            haplotypes_t = haplotypes_t[mask_t]
+
+        # Apply to numpy arrays
         variant_ids = variant_ids[mask]
         start_dist = start_dist[mask]
         if end_dist is not None:
             end_dist = end_dist[mask]
-        if haplotypes_t is not None:
-            haplotypes_t = haplotypes_t[mask_t]
+        variant_idx = variant_idx[mask]
 
     # Interaction MAF filter
+    # TODO: extend for interaction filter
     if interaction_df is not None:
         genotypes_t, mask_t = filter_maf_interaction(
             genotypes_t, interaction_mask_t=None,
