@@ -23,13 +23,21 @@ from utils import (
 
 def _run_association(genotypes_t, phenotype_t, haplotypes_t,
                      residualizer, interaction_df, interaction_t,
-                     variant_ids, device):
+                     variant_ids, device, dof_vector):
     """Run cis or interaction association depending on interaction_df."""
     if interaction_df is None:
-        res = calculate_cis_nominal(
-            genotypes_t, phenotype_t, residualizer=residualizer,
-            haplotypes_t=haplotypes_t
-        )
+        if phenotype_t.shape[0] == 1:
+            res = calculate_cis_nominal(
+                genotypes_t, phenotype_t,
+                residualizer=residualizer,
+                haplotypes_t=haplotypes_t,
+            )
+        else:
+            res = calculate_corr_paired(
+                genotypes_t, haplotypes_t, phenotype_t,
+                residualizer=None, use_pinv=False,
+                return_se_h=True, dof_vector=dof_vector,
+            )
         return [x.cpu().numpy() for x in res], None
     else:
         res = calculate_interaction_nominal(
@@ -111,7 +119,7 @@ def _process_phenotype_window(
         run_eigenmt, mapping_state):
     """
     Process one cis-window for a batch of phenotypes (or group of phenotypes),
-    each with its own window.
+    each with its own window. Run in parallel on GPU.
 
     Returns:
         - n: number of variants analyzed
@@ -119,8 +127,12 @@ def _process_phenotype_window(
         - top_hit: Series with top association (or None)
     """
     device = mapping_state["device"]
-    all_results = []
-    total_pairs = 0
+
+    # Collect phenotype IDs and matrices
+    phenotype_ids = [r[4] for r in rows]
+    geno_list, hap_list, pheno_list = [], [], []
+    varid_list, vardist_list, vardist_end_list, varidx_list = [], [], [], []
+    n_vars_each = []
     
     for phenotype, genotypes, g_idx, haplotypes, phenotype_id in rows:
         # Window-specific variant indices
@@ -133,15 +145,21 @@ def _process_phenotype_window(
         if 'pos' not in phenotype_pos_df:
             end_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_end[phenotype_id]
 
-        genotypes_t, haplotypes_t = _prepare_window_tensors(genotypes, haplotypes,
-                                                            genotype_ix_t, device)
-        filt = _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist,
-                                  end_dist, maf_threshold, interaction_df,
-                                  maf_threshold_interaction, variant_idx, mapping_state)
+        genotypes_t, haplotypes_t = _prepare_window_tensors(
+            genotypes, haplotypes, genotype_ix_t, device
+        )
+        filt = _apply_maf_filters(
+            genotypes_t, haplotypes_t, variant_ids, start_dist,
+            end_dist, maf_threshold, interaction_df,
+            maf_threshold_interaction, variant_idx, mapping_state
+        )
         if filt is None:
             continue
         genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx = filt
 
+        # Phenotype tensor
+        phenotype_t = _prepare_tensor(phenotype, device=device)
+        
         # Residualizer (with optional phenotype-specific covariate)
         if paired_covs_df is not None and phenotype_id in paired_covs_df.index:
             pcov_t = _prepare_tensor(np.c_[covariates_df,
@@ -151,70 +169,126 @@ def _process_phenotype_window(
         else:
             iresidualizer = residualizer
 
-        # Run association model
-        phenotype_t = _prepare_tensor(phenotype, device=device)
-        results, ni = _run_association(genotypes_t, phenotype_t, haplotypes_t,
-                                       iresidualizer, interaction_df, interaction_t,
-                                       variant_ids, device)
-        if interaction_df is None:
-            tstat, beta_g, se_g, beta_h, se_h = results
+        # Residualize before stacking
+        if iresidualizer is not None:
+            genotype_resid = iresidualizer.transform(genotypes_t)
+            phenotype_resid = iresidualizer.transform(phenotype_t.unsqueeze(0)).squeeze(0)
+            if haplotypes_t is not None:
+                H_t = haplotypes_t.permute(0, 2, 1).reshape(-1, haplotypes_t.shape[1])
+                H_resid = iresidualizer.transform(H_t).reshape(
+                    haplotypes_t.shape[0], haplotypes_t.shape[2], haplotypes_t.shape[1]
+                ).permute(0, 2, 1)
+            else:
+                H_resid = None
+        else:
+            genotype_resid = genotypes_t
+            phenotype_resid = phenotype_t
+            H_resid = haplotypes_t
+
+        # Collect lists
+        geno_list.append(genotype_resid)
+        hap_list.append(H_resid)
+        pheno_list.append(phenotype_resid.repeat(genotype_resid.shape[0], 1))
+        varid_list.append(variant_ids)
+        vardist_list.append(start_dist)
+        vardist_end_list.append(end_dist)
+        varidx_list.append(variant_idx)
+        n_vars_each.append(genotype_resid.shape[0])
+
+    if not geno_list:
+        return None
+
+    # Concatenate across phenotypes
+    geno_all = torch.cat(geno_list, dim=0)
+    pheno_all = torch.cat(pheno_list, dim=0)
+    if any(h is not None for h in hap_list):
+        hap_all = torch.cat([h for h in hap_list if h is not None], dim=0)
+    else:
+        hap_all = None
+
+    # Build degrees of freedom
+    dof_list = []
+    n_samples = phenotype_resid.shape[0] if phenotype_resid.ndim == 1 else phenotype_resid.shape[1]
+    n_covs = covariates_df.shape[1] if covariates_df is not None else 0
+    k = hap_list[0].shape[2] if hap_list and hap_list[0] is not None else 0
+
+    for pid, n_vars in zip(phenotype_ids, n_vars_each):
+        if paired_covs_df is not None and pid in paired_covs_df.index:
+            extra_covs = 1
+        else:
+            extra_covs = 0
+        dof_val = n_samples - (n_covs + extra_covs + 1 + k)
+        dof_list.append(np.full(n_vars, dof_val, dtype=np.float32))
+    dof_vector = torch.from_numpy(np.concatenate(dof_list)).to(device)
+    
+    # Run association model
+    results, ni = _run_association(
+        geno_all, pheno_all, hap_all, None, # already residualized
+        interaction_df, interaction_t,
+        np.concatenate(varid_list), device, dof_vector
+    )
+    if interaction_df is None:
+        tstat, beta_g, se_g, beta_h, se_h = results
+        # Build results
+        offset = 0
+        all_results = []
+        for pid, variant_ids, start_dist, end_dist, variant_idx, n_vars in zip(
+                phenotype_ids, varid_list, vardist_list, vardist_end_list,
+                varidx_list, n_vars_each):
+            slice_t = slice(offset, offset + n_vars)
             result = dict(
-                phenotype_id=[phenotype_id] * len(variant_ids),
+                phenotype_id=[pid] * n_vars,
                 variant_id=variant_ids, start_distance=start_dist,
                 af=mapping_state["af_all"][variant_idx],
                 ma_samples=mapping_state["ma_samples_all"][variant_idx],
                 ma_count=mapping_state["ma_count_all"][variant_idx],
-                pval_nominal=tstat, beta_g=beta_g, se_g=se_g,
-                **_unpack_hap_effects(beta_h, se_h)
+                pval_nominal=tstat[slice_t],
+                beta_g=beta_g[slice_t],
+                se_g=se_g[slice_t],
+                **_unpack_hap_effects(beta_h[slice_t], se_h[slice_t])
             )
             if end_dist is not None:
                 result['end_distance'] = end_dist
-
             all_results.append(result)
-            total_pairs += len(variant_ids)
-        else:
-            #TODO fix interaction model
-            tstat, b, b_se, af, ma_samples, ma_count = results
-            ni = interaction_df.shape[1]
-            result = dict(
-                phenotype_id=[phenotype_id] * len(variant_ids),
-                variant_id=variant_ids,
-                start_distance=start_dist,
-                af=af, ma_samples=ma_samples, ma_count=ma_count,
-                pval_g=tstat[:, 0], b_g=b[:, 0], b_g_se=b_se[:, 0],
-                pval_i=tstat[:, 1:1 + ni], b_i=b[:, 1:1 + ni], b_i_se=b_se[:, 1:1 + ni],
-                pval_gi=tstat[:, 1 + ni:], b_gi=b[:, 1 + ni:], b_gi_se=b_se[:, 1 + ni:]
-            )
-            if end_dist is not None:
-                result['end_distance'] = end_dist
+            offset += n_vars
+    else:
+        #TODO fix interaction model
+        tstat, b, b_se, af, ma_samples, ma_count = results
+        ni = interaction_df.shape[1]
+        result = dict(
+            phenotype_id=[phenotype_id] * len(variant_ids),
+            variant_id=variant_ids,
+            start_distance=start_dist,
+            af=af, ma_samples=ma_samples, ma_count=ma_count,
+            pval_g=tstat[:, 0], b_g=b[:, 0], b_g_se=b_se[:, 0],
+            pval_i=tstat[:, 1:1 + ni], b_i=b[:, 1:1 + ni], b_i_se=b_se[:, 1:1 + ni],
+            pval_gi=tstat[:, 1 + ni:], b_gi=b[:, 1 + ni:], b_gi_se=b_se[:, 1 + ni:]
+        )
+        if end_dist is not None:
+            result['end_distance'] = end_dist
 
-            # Top association
-            ix = np.nanargmax(np.abs(tstat[:, 1 + ni:]).max(1))
-            top = dict(
-                phenotype_id=phenotype_id,
-                variant_id=variant_ids[ix],
-                start_distance=start_dist[ix],
-                af=af[ix], ma_samples=ma_samples[ix], ma_count=ma_count[ix],
-            )
-            if end_dist is not None:
-                top['end_distance'] = end_dist[ix]
-            for i in range(tstat.shape[1]):
-                top[f'stat_{i}'] = tstat[ix, i]
-                top[f'beta_{i}'] = b[ix, i]
-                top[f'se_{i}'] = b_se[ix, i]
-            if run_eigenmt:
-                top['tests_emt'] = eigenmt.compute_tests(genotypes_t)
+        # Top association
+        ix = np.nanargmax(np.abs(tstat[:, 1 + ni:]).max(1))
+        top = dict(
+            phenotype_id=phenotype_id,
+            variant_id=variant_ids[ix],
+            start_distance=start_dist[ix],
+            af=af[ix], ma_samples=ma_samples[ix], ma_count=ma_count[ix],
+        )
+        if end_dist is not None:
+            top['end_distance'] = end_dist[ix]
+        for i in range(tstat.shape[1]):
+            top[f'stat_{i}'] = tstat[ix, i]
+            top[f'beta_{i}'] = b[ix, i]
+            top[f'se_{i}'] = b_se[ix, i]
+        if run_eigenmt:
+            top['tests_emt'] = eigenmt.compute_tests(genotypes_t)
 
-            raise NotImplementedError("Interaction model not yet batched")
+        raise NotImplementedError("Interaction model not yet batched")
 
-    # Merge all results into one dict of arrays
-    if total_pairs == 0:
-        return None
-
-    merged = {}
-    for key in all_results[0]:
-        merged[key] = np.concatenate([r[key] for r in all_results], axis=0)
-
+    # Merge dicts
+    merged = {k: np.concatenate([r[k] for r in all_results], axis=0) for k in all_results[0]}
+    total_pairs = sum(n_vars_each)
     top_all = None
     return total_pairs, merged, top_all
 
