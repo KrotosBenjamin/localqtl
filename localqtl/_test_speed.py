@@ -97,12 +97,10 @@ def calculate_corr_paired_zstack(G_t, H_t, Y_t):
     XtX = XtX.unsqueeze(1).expand(-1, n_pheno, -1, -1)  # (v,p,2+k,2+k)
     XtY = XtY.unsqueeze(-1)                             # (v,p,2+k,1)
 
-    # Solve
     L = torch.linalg.cholesky(XtX)
-    rhs = XtY.squeeze(-1).transpose(-1, -2)
-    Z = torch.linalg.solve_triangular(L, rhs, upper=False)
+    Z = torch.linalg.solve_triangular(L, XtY, upper=False)
     beta = torch.linalg.solve_triangular(L.transpose(-1,-2), Z, upper=True)
-    return beta.transpose(-1,-2)  # (v,p,2+k)
+    return beta.squeeze(-1)  # (v,p,2+k)
 
 
 # ------------------------
