@@ -271,6 +271,15 @@ def calculate_corr_paired(
     """
     n_variants, n_samples = G_t.shape
 
+    # Normalize Y shape
+    if Y_t.ndim == 1:                       # (n_samples,)
+        Y_t = Y_t.unsqueeze(0)              # -> (1, n_samples)
+    elif Y_t.ndim == 2:
+        if Y_t.shape[0] not in (1, n_variants):
+            raise ValueError(f"bad Y_t shape {Y_t.shape}")
+    else:
+        raise ValueError(f"bad Y_t ndim {Y_t.ndim}, shape={Y_t.shape}")
+    
     # Haplotype handling
     if H_t.ndim == 2: # Shared across
         H_t = H_t.unsqueeze(2)  # (n_variants x n_samples x 1)
@@ -311,16 +320,16 @@ def calculate_corr_paired(
 
     # Assemble XtY
     if Y_t.shape[0] == 1:
-        y = Y_t.squeeze(0)                            # (n_samples,)
+        y = Y_t.view(-1)
         XtY = torch.cat([
-            y.sum().view(1).expand(n_variants, 1),    # (n_variants, 1)
-            (G_t * y).sum(1, keepdim=True),           # (n_variants, 1)
-            torch.einsum("s,vsk->vk", y, H_t)         # (n_variants, k)
-        ], dim=1).unsqueeze(-1)                       # (n_variants, 2 + k, 1)
+            y.sum().expand(n_variants, 1),      # (n_variants, 1)
+            (G_t * y).sum(1, keepdim=True),     # (n_variants, 1)
+            torch.einsum("s,vsk->vk", y, H_t)   # (n_variants, k)
+        ], dim=1).unsqueeze(-1)                 # (n_variants, 2 + k, 1)
     elif Y_t.shape[0] == n_variants:
         XtY = torch.cat([
-            Y_t.sum(1),
-            (G_t * Y_t).sum(1),
+            Y_t.sum(1, keepdim=True),
+            (G_t * Y_t).sum(1, keepdim=True),
             torch.einsum("vs,vsk->vk", Y_t, H_t)
         ], dim=1).unsqueeze(-1)
     else:
