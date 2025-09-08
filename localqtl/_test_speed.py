@@ -28,27 +28,28 @@ def make_mapping_state(n_variants, device):
         ma_count_all=np.random.randint(5, 50, n_variants),
     )
 
-
 # ------------------------
 # CLI arguments
 # ------------------------
 parser = argparse.ArgumentParser(description="Profile _process_phenotype_window")
 parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
-parser.add_argument("--variants", type=int, default=10_000)
+parser.add_argument("--variants", type=int, default=50_000)
 parser.add_argument("--samples", type=int, default=500)
 parser.add_argument("--phenotypes", type=int, default=10)
 parser.add_argument("--haps", type=int, default=2)
+parser.add_argument("--window", type=int, default=500,
+                    help="Number of variants per phenotype window")
 args = parser.parse_args()
 
 n_variants   = args.variants
 n_samples    = args.samples
 n_phenotypes = args.phenotypes
 k_haps       = args.haps
+window       = args.window
 device       = args.device
 
 torch.manual_seed(42)
 np.random.seed(42)
-
 
 # ------------------------
 # Synthetic data
@@ -81,14 +82,22 @@ covariates_df = pd.DataFrame(np.random.randn(n_samples, 3),
 # mapping_state
 mapping_state = make_mapping_state(n_variants, device)
 
-# genotype_ix_t: identity mapping for now
-genotype_ix_t = torch.arange(n_variants)
-
-# rows: [(phenotype, genotypes, g_idx, haplotypes, phenotype_id), ...]
+# ------------------------
+# Build rows with fixed-size windows
+# ------------------------
 rows = []
 for pid, pheno in zip(phenotype_ids, phenotypes):
-    g_idx = np.arange(n_variants)  # all variants in window
-    rows.append((pheno, genotypes, g_idx, haplotypes, pid))
+    # pick a contiguous window start
+    start = np.random.randint(0, n_variants - window)
+    g_idx = np.arange(start, start + window)
+
+    geno_slice = genotypes[g_idx]
+    hap_slice = haplotypes[g_idx]
+
+    rows.append((pheno, geno_slice, g_idx, hap_slice, pid))
+
+# genotype_ix_t: index tensor just covers the window
+genotype_ix_t = torch.arange(window)
 
 
 # ------------------------
@@ -111,7 +120,8 @@ def run_profile():
                 maf_threshold_interaction=None, run_eigenmt=False,
                 mapping_state=mapping_state
             )
-        torch.cuda.synchronize() if device == "cuda" else None
+        if device == "cuda":
+            torch.cuda.synchronize()
         prof.step()
     end = time.time()
 
