@@ -2,17 +2,22 @@
 import argparse
 import torch
 import time
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 
 # ------------------------
 # CLI arguments
 # ------------------------
-parser = argparse.ArgumentParser(description="Profile calculate_corr_paired with batched phenotypes")
+parser = argparse.ArgumentParser(description="Profile calculate_corr_paired with flexible phenotypes")
 parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
-parser.add_argument("--variants", type=int, default=100_000)
+parser.add_argument("--variants", type=int, default=50_000)
 parser.add_argument("--samples", type=int, default=1000)
-parser.add_argument("--phenotypes", type=int, default=64)  # batch size of phenotypes
+parser.add_argument("--phenotypes", type=int, default=64,
+                    help="Number of shared phenotypes if --mode=batch")
 parser.add_argument("--haps", type=int, default=2)
+parser.add_argument("--mode", default="batch", choices=["batch", "per_variant", "both"],
+                    help="Phenotype layout: batch=(p,s), per_variant=(v,s), both=run both")
+parser.add_argument("--logdir", default="./profiler_log",
+                    help="Directory for TensorBoard traces")
 args = parser.parse_args()
 
 n_variants   = args.variants
@@ -32,50 +37,44 @@ G_t = torch.randint(0, 3, (n_variants, n_samples),
 
 # Haplotypes (variants × samples × k)
 H_t = torch.rand(n_variants, n_samples, k_haps, device=device)
-
-# If k=2 (two ancestries), collapse to 1 covariate to avoid collinearity
-if k_haps == 2:
+if k_haps == 2:  # collapse collinear haplotype
     H_t = H_t[:, :, :1]
     k_haps = 1
 
-# Phenotypes (batch of phenotypes × samples)
-Y_t = torch.randn(n_phenotypes, n_samples, device=device)
-
-print(f"Generated test data: {n_variants} variants × {n_samples} samples × {n_phenotypes} phenotypes")
-print(f"Haplotype covariates: {k_haps}")
 
 # ------------------------
-# Dummy residualizer (identity)
+# Regression function
 # ------------------------
-class DummyResidualizer:
-    def transform(self, X):
-        return X
-residualizer = DummyResidualizer()
-
-# ------------------------
-# Batched regression function
-# ------------------------
-def calculate_corr_paired_batched(G_t, H_t, Y_t):
+def calculate_corr_paired_zstack(G_t, H_t, Y_t):
     """
-    Batched regression: multiple phenotypes per variant.
-    G_t: (n_variants, n_samples)
-    H_t: (n_variants, n_samples, k)
-    Y_t: (n_phenotypes, n_samples)
+    Unified regression:
+      - Y_t (p,s)  : shared phenotypes across variants
+      - Y_t (v,s)  : per-variant phenotypes
+      - Y_t (v,p,s): p phenotypes per variant
     """
     n_variants, n_samples = G_t.shape
-    n_pheno = Y_t.shape[0]
     _, _, k = H_t.shape
 
-    # Precompute haplotype-only constants
-    sum_h = H_t.sum(1) # (n_variants, k)
-    HtH   = H_t.transpose(1, 2) @ H_t
+    # Normalize Y_t -> (v,p,s)
+    if Y_t.dim() == 2:
+        if Y_t.shape[0] == n_variants:   # (v,s)
+            Y_t = Y_t.unsqueeze(1)       # (v,1,s)
+        else:                            # (p,s)
+            Y_t = Y_t.unsqueeze(0).expand(n_variants, -1, -1)  # (v,p,s)
+    elif Y_t.dim() == 3:
+        pass
+    else:
+        raise ValueError("Y_t must be (p,s), (v,s), or (v,p,s)")
 
-    # Genotype scalars
-    sum_g  = G_t.sum(1) # (n_variants,)
+    n_pheno = Y_t.shape[1]
+
+    # Precompute scalars
+    sum_h = H_t.sum(1)                   # (v,k)
+    HtH   = H_t.transpose(1, 2) @ H_t    # (v,k,k)
+    sum_g  = G_t.sum(1)                  # (v,)
     sum_g2 = (G_t**2).sum(1)
     sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)
 
-    # Assemble XtX per variant
     XtX = torch.empty((n_variants, 2 + k, 2 + k),
                       device=G_t.device, dtype=G_t.dtype)
     XtX[:, 0, 0]   = n_samples
@@ -85,47 +84,65 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
     XtX[:, 1, 2:]  = XtX[:, 2:, 1] = sum_gh
     XtX[:, 2:, 2:] = HtH
 
-    # Now build XtY for all phenotypes at once
-    # G_t: (v,s), Y_t: (p,s), H_t: (v,s,k)
-    sum_y  = Y_t.sum(1)                                 # (p,)
-    sum_gy = G_t @ Y_t.T                                # (v,p)
-    sum_hy = torch.einsum("vsk,ps->vpk", H_t, Y_t)      # (v,p,k)
+    # XtY
+    sum_y  = Y_t.sum(2)                                # (v,p)
+    sum_gy = torch.einsum("vs,vps->vp", G_t, Y_t)      # (v,p)
+    sum_hy = torch.einsum("vsk,vps->vpk", H_t, Y_t)    # (v,p,k)
 
-    # XtY shape: (v, p, 2+k)
     XtY = torch.zeros((n_variants, n_pheno, 2+k), device=G_t.device)
-    XtY[:, :, 0] = sum_y.unsqueeze(0).expand(n_variants, -1)
+    XtY[:, :, 0] = sum_y
     XtY[:, :, 1] = sum_gy
     XtY[:, :, 2:] = sum_hy
-    XtY = XtY.unsqueeze(-1)  # (v, p, 2+k, 1)
 
-    # Solve per phenotype: vectorized
-    # broadcast XtX: (v,1,2+k,2+k) vs XtY: (v,p,2+k,1)
+    XtX = XtX.unsqueeze(1).expand(-1, n_pheno, -1, -1)  # (v,p,2+k,2+k)
+    XtY = XtY.unsqueeze(-1)                             # (v,p,2+k,1)
+
+    # Solve
     L = torch.linalg.cholesky(XtX)
-    rhs = XtY.squeeze(-1).transpose(1,2)
+    rhs = XtY.squeeze(-1).transpose(-1, -2)
     Z = torch.linalg.solve_triangular(L, rhs, upper=False)
     beta = torch.linalg.solve_triangular(L.transpose(-1,-2), Z, upper=True)
-    beta = beta.transpose(1,2)
+    return beta.transpose(-1,-2)  # (v,p,2+k)
 
+
+# ------------------------
+# Profiling helper
+# ------------------------
+def run_profile(Y_t, tag):
+    print(f"\nProfiling mode={tag}...")
+    start = time.time()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        on_trace_ready=tensorboard_trace_handler(f"{args.logdir}/{tag}")
+    ) as prof:
+        # Warm-up
+        for _ in range(3):
+            _ = calculate_corr_paired_zstack(G_t, H_t, Y_t)
+        torch.cuda.synchronize()
+
+        # Timed run
+        with record_function("calculate_corr_paired_zstack"):
+            beta = calculate_corr_paired_zstack(G_t, H_t, Y_t)
+        torch.cuda.synchronize()
+        prof.step()
+    end = time.time()
+
+    print(f"Runtime ({tag}): {end - start:.2f} sec")
+    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
     return beta
 
+
 # ------------------------
-# Profiling
+# Run
 # ------------------------
-print("Starting profiling run...")
-start = time.time()
+if args.mode in ["batch", "both"]:
+    Y_batch = torch.randn(n_phenotypes, n_samples, device=device)
+    run_profile(Y_batch, "batch")
 
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    record_shapes=True,
-    profile_memory=True,
-    with_stack=True
-) as prof:
-    with record_function("calculate_corr_paired_batched_test"):
-        beta = calculate_corr_paired_batched(G_t, H_t, Y_t)
+if args.mode in ["per_variant", "both"]:
+    Y_var = torch.randn(n_variants, n_samples, device=device)
+    run_profile(Y_var, "per_variant")
 
-if device == "cuda":
-    torch.cuda.synchronize()
-end = time.time()
-
-print(f"Runtime: {end - start:.2f} seconds")
-print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=15))
+print(f"\nTrace written to {args.logdir}. Run `tensorboard --logdir={args.logdir}` to explore.")
