@@ -55,7 +55,7 @@ def _run_association(genotypes_t, phenotype_t, haplotypes_t,
 def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
                     group_s, genotype_df, sample_ids, maf_threshold, interaction_df,
                     maf_threshold_interaction, logp, run_eigenmt, verbose,
-                    start_time, covariates_df):
+                    start_time, covariates_df, start=0):
     """
     Map cis-QTLs for a single chromosome.
 
@@ -76,7 +76,6 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
     chr_res = _init_result_dict(n, interaction_df, phenotype_pos_df)
     best_assoc = []
 
-    start = 0
     genotype_ix = np.array([genotype_df.columns.get_loc(s) for s in sample_ids])
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
 
@@ -111,7 +110,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
         if not isinstance(chr_res[k], list):
             chr_res[k] = chr_res[k][:start]
 
-    return chr_res, best_assoc
+    return chr_res, best_assoc, start
 
 
 def _process_phenotype_window(
@@ -135,13 +134,13 @@ def _process_phenotype_window(
     geno_list, hap_list, pheno_list = [], [], []
     varid_list, vardist_list, vardist_end_list, varidx_list = [], [], [], []
     n_vars_each = []
-    
+
     for phenotype, genotypes, g_idx, haplotypes, phenotype_id in rows:
         # Window-specific variant indices
         variant_idx = g_idx
         variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
         variant_pos = variant_df['pos'].to_numpy(copy=False)
-        
+
         start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_id]
         end_dist = None
         if 'pos' not in phenotype_pos_df:
@@ -161,7 +160,7 @@ def _process_phenotype_window(
 
         # Phenotype tensor
         phenotype_t = _prepare_tensor(phenotype, device=device)
-        
+
         # Residualizer (with optional phenotype-specific covariate)
         if paired_covs_df is not None and phenotype_id in paired_covs_df.index:
             pcov_t = _prepare_tensor(np.c_[covariates_df,
@@ -230,7 +229,7 @@ def _process_phenotype_window(
         dof_val = n_samples - (n_covs + extra_covs + 1 + k)
         dof_list.append(np.full(n_vars, dof_val, dtype=np.float32))
     dof_vector = torch.from_numpy(np.concatenate(dof_list)).to(device)
-    
+
     # Run association model
     results, ni = _run_association(
         geno_all, pheno_all, hap_all, None, # already residualized

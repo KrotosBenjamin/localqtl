@@ -53,7 +53,7 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
         phenotype_pos_df = mapping_state["phenotype_pos_df"]
         group_s = mapping_state["group_s"]
         sample_ids = phenotype_df.columns.tolist()
-    
+
         _log_mapping_context(
             genotype_df, haplotypes, group_s, window,
             None, mapping_state["logger"]
@@ -74,14 +74,15 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
             on_the_fly_impute = on_the_fly_impute,
         )
 
+        start = 0
         best_assoc = []
         start_time = time.time()
         for chrom in igc.chrs:
-            chr_res, top_hits = _map_chromosome(
+            chr_res, top_hits, start = _map_chromosome(
                 chrom, igc, variant_df, phenotype_pos_df, mapping_state,
                 group_s, genotype_df, sample_ids, maf_threshold, interaction_df,
                 maf_threshold_interaction, logp, run_eigenmt, verbose, start_time,
-                covariates_df
+                covariates_df, start
             )
             if write_stats:
                 _write_chromosome_results(
