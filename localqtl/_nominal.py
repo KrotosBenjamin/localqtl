@@ -185,6 +185,9 @@ def _process_phenotype_window(
                     n_var, n_samp, k = H_t.shape
                     H_flat = H_t.reshape(n_var, n_samp * k)
                     H_t = iresid.transform(H_flat).reshape(n_var, n_samp, k)
+
+        if H_t is not None and H_t.ndim == 2:
+            H_t = H_t.unsqueeze(-1)
         # Collect
         geno_list.append(G_t)
         hap_list.append(H_t)

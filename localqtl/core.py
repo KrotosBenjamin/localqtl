@@ -370,8 +370,14 @@ def calculate_corr_paired(
     se_g: Standard error of genotype coefficient.
     se_h: Standard error of haplotype coefficients (if return_se_h is True).
     """
-    n_variants, n_samples = G_t.shape
     n_pheno = Y_t.shape[0]
+    if G_t.ndim == 2:
+        n_variants, n_samples = G_t.shape
+    elif G_t.ndim == 3 and G_t.shape[1] == 1:
+        n_variants, n_samples = G_t.shape[0], G_t.shape[2]
+        G_t = G_t.squeeze(1)  # (v, s)
+    else:
+        raise ValueError(f"G_t must be 2D (v,s), got {G_t.shape}")
 
     # Normalize Y shape
     if Y_t.ndim == 1:                       # (n_samples,)

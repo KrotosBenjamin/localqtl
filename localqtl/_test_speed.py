@@ -24,6 +24,7 @@ def make_mapping_state(n_variants, device):
     return dict(
         device=device,
         af_all=np.random.rand(n_variants),
+        maf_all=np.random.rand(n_variants),
         ma_samples_all=np.random.randint(5, 20, n_variants),
         ma_count_all=np.random.randint(5, 50, n_variants),
     )
@@ -92,12 +93,12 @@ for pid, pheno in zip(phenotype_ids, phenotypes):
     g_idx = np.arange(start, start + window)
 
     geno_slice = genotypes[g_idx]
-    hap_slice = haplotypes[g_idx]
-
+    #hap_slice = haplotypes[g_idx]
+    hap_slice  = torch.zeros((window, n_samples, 1), dtype=torch.float32)
     rows.append((pheno, geno_slice, g_idx, hap_slice, pid))
 
 # genotype_ix_t: index tensor just covers the window
-genotype_ix_t = torch.arange(window)
+genotype_ix_t = None
 
 
 # ------------------------
