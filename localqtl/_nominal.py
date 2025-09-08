@@ -80,8 +80,9 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
 
     # Iterate windows
-    for batch_idx, batch_rows in enumerate(_batch_generator(igc.generate_data(chrom=chrom, verbose=verbose),
-                                                            device=mapping_state["device"])):
+    for batch_idx, batch_rows in enumerate(_batch_generator(
+            igc.generate_data(chrom=chrom, verbose=verbose),
+            device=mapping_state["device"])):
         process_fnc = _process_grouped_phenotype_window if group_s is not None else _process_phenotype_window
         results = process_fnc(
             batch_rows, igc, genotype_ix_t, variant_df, phenotype_pos_df,
@@ -119,187 +120,132 @@ def _process_phenotype_window(
         maf_threshold, interaction_df, maf_threshold_interaction,
         run_eigenmt, mapping_state):
     """
-    Process one cis-window for a batch of phenotypes (or group of phenotypes),
-    each with its own window. Run in parallel on GPU.
+    Process one cis-window *batch*:
+      - stacks all phenotype windows together (z-stack),
+      - runs calculate_corr_paired once,
+      - returns results ready for merge.
 
-    Returns:
-        - n: number of variants analyzed
-        - result_dict: dictionary of results (same structure as chr_res block)
-        - top_hit: Series with top association (or None)
+    Returns
+    -------
+    n_total : int
+        Total number of variant–phenotype pairs
+    merged : dict
+        Block of results (same keys as chr_res)
+    top_hit : None for now (interaction not supported yet)
     """
     device = mapping_state["device"]
 
-    # Collect phenotype IDs and matrices
-    phenotype_ids = [r[4] for r in rows]
     geno_list, hap_list, pheno_list = [], [], []
     varid_list, vardist_list, vardist_end_list, varidx_list = [], [], [], []
-    n_vars_each = []
+    dof_list = []
+    phenotype_ids = []
 
     for phenotype, genotypes, g_idx, haplotypes, phenotype_id in rows:
-        # Window-specific variant indices
         variant_idx = g_idx
-        variant_ids = variant_df.index[g_idx[0]:g_idx[-1] + 1]
+        variant_ids = variant_df.index[g_idx]
         variant_pos = variant_df['pos'].to_numpy(copy=False)
 
-        start_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_start[phenotype_id]
+        start_dist = variant_pos[g_idx] - igc.phenotype_start[phenotype_id]
         end_dist = None
         if 'pos' not in phenotype_pos_df:
-            end_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_end[phenotype_id]
+            end_dist = variant_pos[g_idx] - igc.phenotype_end[phenotype_id]
 
-        genotypes_t, haplotypes_t = _prepare_window_tensors(
-            genotypes, haplotypes, genotype_ix_t, device
-        )
+        # Slice tensors
+        G_t, H_t = _prepare_window_tensors(genotypes, haplotypes, genotype_ix_t, device)
+        phenotype_t = _prepare_tensor(phenotype, device=device)
+
+        # MAF filters
         filt = _apply_maf_filters(
-            genotypes_t, haplotypes_t, variant_ids, start_dist,
-            end_dist, maf_threshold, interaction_df,
+            G_t, H_t, variant_ids, start_dist, end_dist,
+            maf_threshold, interaction_df,
             maf_threshold_interaction, variant_idx, mapping_state
         )
         if filt is None:
             continue
-        genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx = filt
+        G_t, H_t, variant_ids, start_dist, end_dist, variant_idx = filt
 
-        # Phenotype tensor
-        phenotype_t = _prepare_tensor(phenotype, device=device)
-
-        # Residualizer (with optional phenotype-specific covariate)
+        # Residualizer (with optional phenotype-specific covariates)
         if paired_covs_df is not None and phenotype_id in paired_covs_df.index:
-            pcov_t = _prepare_tensor(np.c_[covariates_df,
-                                           paired_covs_df[phenotype_id]],
-                                     device=device)
-            iresidualizer = Residualizer(pcov_t)
+            pcov_t = _prepare_tensor(
+                np.c_[covariates_df, paired_covs_df.loc[[phenotype_id]].values.T],
+                device=device
+            )
+            iresid = Residualizer(pcov_t)
         else:
-            iresidualizer = residualizer
+            iresid = residualizer
 
-        # Residualize before stacking
-        if iresidualizer is not None:
-            genotype_resid = iresidualizer.transform(genotypes_t)
-            phenotype_resid = iresidualizer.transform(phenotype_t.unsqueeze(0)).squeeze(0)
-            if haplotypes_t is not None:
-                if haplotypes_t.ndim == 2:
-                    H_resid = iresidualizer.transform(haplotypes_t)
-                    H_resid = H_resid.unsqueeze(-1)
-                elif haplotypes_t.ndim == 3:
-                    n_var, n_samp, k = haplotypes_t.shape
-                    H_flat = haplotypes_t.reshape(n_var, n_samp * k)
-                    H_resid = iresidualizer.transform(H_flat).reshape(n_var, n_samp, k)
-                else:
-                    raise ValueError(f"Unexpected haplotypes_t.ndim={haplotypes_t.ndim}")
-            else:
-                H_resid = None
-        else:
-            genotype_resid = genotypes_t
-            phenotype_resid = phenotype_t
-            if haplotypes_t is not None and haplotypes_t.ndim == 2:
-                H_resid = haplotypes_t.unsqueeze(-1)
-            else:
-                H_resid = haplotypes_t
-
-        # Collect lists
-        geno_list.append(genotype_resid)
-        hap_list.append(H_resid)
-        pheno_list.append(phenotype_resid.repeat(genotype_resid.shape[0], 1))
+        # Residualize
+        if iresid is not None:
+            G_t = iresid.transform(G_t)
+            phenotype_t = iresid.transform(phenotype_t.unsqueeze(0)).squeeze(0)
+            if H_t is not None:
+                if H_t.ndim == 2:
+                    H_t = iresid.transform(H_t).unsqueeze(-1)
+                elif H_t.ndim == 3:
+                    n_var, n_samp, k = H_t.shape
+                    H_flat = H_t.reshape(n_var, n_samp * k)
+                    H_t = iresid.transform(H_flat).reshape(n_var, n_samp, k)
+        # Collect
+        geno_list.append(G_t)
+        hap_list.append(H_t)
+        pheno_list.append(phenotype_t.repeat(G_t.shape[0], 1))
         varid_list.append(variant_ids)
         vardist_list.append(start_dist)
         vardist_end_list.append(end_dist)
         varidx_list.append(variant_idx)
-        n_vars_each.append(genotype_resid.shape[0])
+        phenotype_ids.append(phenotype_id)
+
+        # DOF per variant in this window
+        n_samples = G_t.shape[1]
+        n_covs = covariates_df.shape[1] if covariates_df is not None else 0
+        k = H_t.shape[2] if H_t is not None else 0
+        extra_covs = 1 if (paired_covs_df is not None and phenotype_id in paired_covs_df.index) else 0
+        dof_val = n_samples - (n_covs + extra_covs + 1 + k)
+        dof_list.append(np.full(G_t.shape[0], dof_val, dtype=np.float32))
 
     if not geno_list:
         return None
 
-    # Concatenate across phenotypes
-    geno_all = torch.cat(geno_list, dim=0)
-    pheno_all = torch.cat(pheno_list, dim=0)
-    if any(h is not None for h in hap_list):
-        hap_all = torch.cat([h for h in hap_list if h is not None], dim=0)
-    else:
-        hap_all = None
-
-    # Build degrees of freedom
-    dof_list = []
-    n_samples = phenotype_resid.shape[0] if phenotype_resid.ndim == 1 else phenotype_resid.shape[1]
-    n_covs = covariates_df.shape[1] if covariates_df is not None else 0
-    k = hap_list[0].shape[2] if hap_list and hap_list[0] is not None else 0
-
-    for pid, n_vars in zip(phenotype_ids, n_vars_each):
-        if paired_covs_df is not None and pid in paired_covs_df.index:
-            extra_covs = 1
-        else:
-            extra_covs = 0
-        dof_val = n_samples - (n_covs + extra_covs + 1 + k)
-        dof_list.append(np.full(n_vars, dof_val, dtype=np.float32))
+    # --- Z-stack all windows ---
+    G_all = torch.cat(geno_list, dim=0)             # (Σv, s)
+    H_all = torch.cat([h for h in hap_list if h is not None], dim=0) if any(h is not None for h in hap_list) else None
+    Y_all = torch.cat(pheno_list, dim=0)            # (Σv, s)
     dof_vector = torch.from_numpy(np.concatenate(dof_list)).to(device)
 
-    # Run association model
-    results, ni = _run_association(
-        geno_all, pheno_all, hap_all, None, # already residualized
-        interaction_df, interaction_t,
-        np.concatenate(varid_list), device, dof_vector
+    # --- Run regression once ---
+    beta_g, beta_h, tstat_g, se_g, se_h = calculate_corr_paired(
+        G_all, H_all, Y_all, residualizer=None, dof_vector=dof_vector
     )
-    if interaction_df is None:
-        tstat, beta_g, se_g, beta_h, se_h = results
-        # Build results
-        offset = 0
-        all_results = []
-        for pid, variant_ids, start_dist, end_dist, variant_idx, n_vars in zip(
-                phenotype_ids, varid_list, vardist_list, vardist_end_list,
-                varidx_list, n_vars_each):
-            slice_t = slice(offset, offset + n_vars)
-            result = dict(
-                phenotype_id=[pid] * n_vars,
-                variant_id=variant_ids, start_distance=start_dist,
-                af=mapping_state["af_all"][variant_idx],
-                ma_samples=mapping_state["ma_samples_all"][variant_idx],
-                ma_count=mapping_state["ma_count_all"][variant_idx],
-                pval_nominal=tstat[slice_t],
-                beta_g=beta_g[slice_t],
-                se_g=se_g[slice_t],
-                **_unpack_hap_effects(beta_h[slice_t], se_h[slice_t])
-            )
-            if end_dist is not None:
-                result['end_distance'] = end_dist
-            all_results.append(result)
-            offset += n_vars
-    else:
-        #TODO fix interaction model
-        tstat, b, b_se, af, ma_samples, ma_count = results
-        ni = interaction_df.shape[1]
+
+    # --- Build results back into flat dict ---
+    results = []
+    offset = 0
+    for pid, variant_ids, start_dist, end_dist, variant_idx, n_vars in zip(
+            phenotype_ids, varid_list, vardist_list, vardist_end_list, varidx_list,
+            [g.shape[0] for g in geno_list]):
+        sl = slice(offset, offset + n_vars)
         result = dict(
-            phenotype_id=[phenotype_id] * len(variant_ids),
+            phenotype_id=[pid] * n_vars,
             variant_id=variant_ids,
             start_distance=start_dist,
-            af=af, ma_samples=ma_samples, ma_count=ma_count,
-            pval_g=tstat[:, 0], b_g=b[:, 0], b_g_se=b_se[:, 0],
-            pval_i=tstat[:, 1:1 + ni], b_i=b[:, 1:1 + ni], b_i_se=b_se[:, 1:1 + ni],
-            pval_gi=tstat[:, 1 + ni:], b_gi=b[:, 1 + ni:], b_gi_se=b_se[:, 1 + ni:]
+            af=mapping_state["af_all"][variant_idx],
+            ma_samples=mapping_state["ma_samples_all"][variant_idx],
+            ma_count=mapping_state["ma_count_all"][variant_idx],
+            pval_nominal=tstat_g[sl].cpu().numpy(),
+            beta_g=beta_g[sl].cpu().numpy(),
+            se_g=se_g[sl].cpu().numpy(),
+            **_unpack_hap_effects(beta_h[sl].cpu().numpy(), se_h[sl].cpu().numpy())
         )
         if end_dist is not None:
-            result['end_distance'] = end_dist
+            result["end_distance"] = end_dist
+        results.append(result)
+        offset += n_vars
 
-        # Top association
-        ix = np.nanargmax(np.abs(tstat[:, 1 + ni:]).max(1))
-        top = dict(
-            phenotype_id=phenotype_id,
-            variant_id=variant_ids[ix],
-            start_distance=start_dist[ix],
-            af=af[ix], ma_samples=ma_samples[ix], ma_count=ma_count[ix],
-        )
-        if end_dist is not None:
-            top['end_distance'] = end_dist[ix]
-        for i in range(tstat.shape[1]):
-            top[f'stat_{i}'] = tstat[ix, i]
-            top[f'beta_{i}'] = b[ix, i]
-            top[f'se_{i}'] = b_se[ix, i]
-        if run_eigenmt:
-            top['tests_emt'] = eigenmt.compute_tests(genotypes_t)
-
-        raise NotImplementedError("Interaction model not yet batched")
-
-    # Merge dicts
-    merged = {k: np.concatenate([r[k] for r in all_results], axis=0) for k in all_results[0]}
-    total_pairs = sum(n_vars_each)
-    top_all = None
-    return total_pairs, merged, top_all
+    merged = {k: np.concatenate([r[k] for r in results], axis=0)
+              for k in results[0]}
+    n_total = offset
+    ## TODO: interaction model
+    return n_total, merged, None
 
 
 def _process_grouped_phenotype_window(
@@ -327,18 +273,18 @@ def _process_grouped_phenotype_window(
     if 'pos' not in phenotype_pos_df:
         end_dist = variant_pos[g_idx[0]:g_idx[-1] + 1] - igc.phenotype_end[phenotype_ids[0]]
 
-    genotypes_t, haplotypes_t = _prepare_window_tensors(genotypes, haplotypes,
+    G_t, H_t = _prepare_window_tensors(genotypes, haplotypes,
                                                         genotype_ix_t, device)
-    filt = _apply_maf_filters(genotypes_t, haplotypes_t, variant_ids, start_dist,
+    filt = _apply_maf_filters(G_t, H_t, variant_ids, start_dist,
                               end_dist, maf_threshold, interaction_df,
                               maf_threshold_interaction, variant_idx, mapping_state)
     if filt is None:
         return None
-    genotypes_t, haplotypes_t, variant_ids, start_dist, end_dist, variant_idx = filt
+    G_t, H_t, variant_ids, start_dist, end_dist, variant_idx = filt
 
     # Run for first phenotype
     phenotype_t = _prepare_tensor(phenotypes[0], device=device)
-    results, _ = _run_association(genotypes_t, phenotype_t, haplotypes_t,
+    results, _ = _run_association(G_t, phenotype_t, H_t,
                                   residualizer, interaction_df, interaction_t,
                                   variant_ids, device)
 
@@ -355,7 +301,7 @@ def _process_grouped_phenotype_window(
     # Iterate over remaining phenotypes and update stronger associations
     for phenotype, pid in zip(phenotypes[1:], phenotype_ids[1:]):
         phenotype_t = _prepare_tensor(phenotype, device=device)
-        results, _ = _run_association(genotypes_t, phenotype_t, haplotypes_t,
+        results, _ = _run_association(G_t, phenotype_t, H_t,
                                       residualizer, interaction_df, interaction_t,
                                       variant_ids, device)
         if interaction_df is None:
@@ -404,6 +350,6 @@ def _process_grouped_phenotype_window(
             top[f'beta_{i}'] = b[ix, i]
             top[f'se_{i}'] = b_se[ix, i]
         if run_eigenmt:
-            top['tests_emt'] = eigenmt.compute_tests(genotypes_t)
+            top['tests_emt'] = eigenmt.compute_tests(G_t)
 
     return len(variant_ids), result, pd.Series(top)

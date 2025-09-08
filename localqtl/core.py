@@ -243,23 +243,124 @@ def calculate_corr(X_t, Y_t, residualizer=None, return_var=False):
         return cor_t.squeeze(1)
 
 
+def calculate_corr_paired_windows(
+    G_all, H_all, Y_all, windows,
+    residualizer=None, use_pinv=False, return_se_h=True,
+    covariates_df=None, paired_covs_df=None,
+    phenotype_ids=None, variant_ids=None,
+    device="cuda"
+):
+    """
+    Windowed batched regression: for each (variant_idx, gene_idx) window,
+    stack phenotypes and regress Y ~ G + H.
+
+    Parameters
+    ----------
+    G_all : (n_variants_total, n_samples) tensor
+        Full genotype matrix.
+    H_all : (n_variants_total, n_samples, k) tensor or None
+        Full haplotype matrix.
+    Y_all : (n_genes_total, n_samples) tensor
+        Full phenotype matrix.
+    windows : list of (variant_idx, gene_idx)
+        variant_idx : 1D array of variant indices for the window
+        gene_idx : int or list[int] of phenotype indices for the window
+    residualizer : Residualizer or None
+        Optional covariate residualizer.
+    covariates_df, paired_covs_df : optional covariate matrices
+    phenotype_ids, variant_ids : optional lists of IDs
+    device : str
+        "cuda" or "cpu".
+
+    Returns
+    -------
+    results : list of dict
+        One dict per window with keys:
+            - phenotype_id
+            - variant_id
+            - beta_g, se_g, tstat_g
+            - beta_h, se_h (if return_se_h)
+    """
+    results = []
+
+    for variant_idx, gene_idx in windows:
+        # Slice window
+        G_t = G_all[variant_idx].to(device)              # (v,s)
+        H_t = H_all[variant_idx].to(device) if H_all is not None else None
+        if np.isscalar(gene_idx):
+            Y_t = Y_all[gene_idx:gene_idx+1].to(device)  # (1,s)
+            pheno_ids = [phenotype_ids[gene_idx]] if phenotype_ids is not None else [gene_idx]
+        else:
+            Y_t = Y_all[gene_idx].to(device)             # (p,s)
+            pheno_ids = [phenotype_ids[g] for g in gene_idx] if phenotype_ids is not None else gene_idx
+
+        # Residualization (optional, same as before)
+        if residualizer is not None:
+            G_t = residualizer.transform(G_t)
+            Y_t = residualizer.transform(Y_t)
+            if H_t is not None:
+                if H_t.ndim == 2:
+                    H_t = residualizer.transform(H_t).unsqueeze(-1)
+                elif H_t.ndim == 3:
+                    n_var, n_samp, k = H_t.shape
+                    H_flat = H_t.reshape(n_var, n_samp * k)
+                    H_t = residualizer.transform(H_flat).reshape(n_var, n_samp, k)
+
+        # Build dof_vector per variant (all phenotypes share)
+        n_samples = G_t.shape[1]
+        n_covs = covariates_df.shape[1] if covariates_df is not None else 0
+        k = H_t.shape[2] if H_t is not None else 0
+        dof_val = n_samples - (n_covs + 1 + k)
+        dof_vector = torch.full((G_t.shape[0],), float(dof_val), device=device)
+
+        # Run regression (z-stacked across phenotypes in this window)
+        beta_g, beta_h, tstat_g, se_g, se_h = calculate_corr_paired(
+            G_t, H_t, Y_t, residualizer=None,
+            use_pinv=use_pinv, return_se_h=return_se_h,
+            dof_vector=dof_vector
+        )
+
+        # Pack results
+        v_ids = [variant_ids[i] for i in variant_idx] if variant_ids is not None else variant_idx
+        for j, pid in enumerate(pheno_ids):
+            res = dict(
+                phenotype_id=pid,
+                variant_id=v_ids,
+                beta_g=beta_g[:, j].detach().cpu().numpy(),
+                se_g=se_g[:, j].detach().cpu().numpy(),
+                tstat_g=tstat_g[:, j].detach().cpu().numpy()
+            )
+            if return_se_h and beta_h.numel() > 0:
+                for h in range(beta_h.shape[2]):
+                    res[f"beta_h_{h}"] = beta_h[:, j, h].detach().cpu().numpy()
+                    res[f"se_h_{h}"] = se_h[:, j, h].detach().cpu().numpy()
+            results.append(res)
+
+    return results
+
+
 def calculate_corr_paired(
         G_t, H_t, Y_t, residualizer=None, use_pinv=False,
         return_se_h=True, dof_vector=None,
 ):
     """
-    Batched regression: Y ~ g + h (paired haplotypes for each variant).
-    Vectorized closed-form implementation.
+    Batched regression: Y ~ g + h (paired haplotypes per variant).
+    Multiple phenotypes supported in parallel.
 
-    Parameters:
+    Parameters
     ----------
-    G_t: Tensor of shape (n_variants, n_samples), genotypes.
-    H_t: Tensor of shape (n_variants, n_samples, k) or (n_samples, k), haplotypes.
-    Y_t: Tensor of shape (1, n_samples) or (n_variants, n_samples), phenotypes.
-    residualizer: Optional residualizer with `.transform()` and optional `.dof`.
-    use_pinv: Use pseudo-inverse instead of solve for XtX.
-    return_se_h: If True, return standard error for haplotype effects.
-    dof_vector: Optional tensor of shape (n_variants,) for degrees of freedom.
+    G_t : (n_variants, n_samples)
+        Genotypes.
+    H_t : (n_variants, n_samples, k)
+        Haplotype covariates (per variant).
+    Y_t : (n_pheno, n_samples)
+        Phenotype matrix (batched).
+    residualizer : object, optional
+        If provided, must implement `.transform(X)`.
+    return_se_h : bool
+        Return SEs for haplotypes if True.
+    dof_vector : (n_variants,), optional
+        Custom degrees of freedom per variant.
 
     Returns:
     -------
@@ -270,13 +371,15 @@ def calculate_corr_paired(
     se_h: Standard error of haplotype coefficients (if return_se_h is True).
     """
     n_variants, n_samples = G_t.shape
+    n_pheno = Y_t.shape[0]
 
     # Normalize Y shape
     if Y_t.ndim == 1:                       # (n_samples,)
         Y_t = Y_t.unsqueeze(0)              # -> (1, n_samples)
     elif Y_t.ndim == 2:
-        if Y_t.shape[0] not in (1, n_variants):
-            raise ValueError(f"bad Y_t shape {Y_t.shape}")
+        n_pheno = Y_t.shape[0]
+        if Y_t.shape[1] != n_samples:
+            raise ValueError(f"Y_t must have n_samples={n_samples} in dim=1, got {Y_t.shape}")
     else:
         raise ValueError(f"bad Y_t ndim {Y_t.ndim}, shape={Y_t.shape}")
 
@@ -291,26 +394,20 @@ def calculate_corr_paired(
     if residualizer is not None:
         G_t = residualizer.transform(G_t)
         Y_t = residualizer.transform(Y_t)
-        H_t = torch.stack(
-            [residualizer.transform(H_t[i].T) for i in range(H_t.shape[0])],
-            dim=0
-        ).reshape(n_variants, n_samples, k)
-
-    # Build X'X blockwise
-    ones = torch.ones((n_samples,), device=G_t.device, dtype=G_t.dtype)
+        H_t = residualizer.transform(H_t.reshape(-1, k)).reshape(n_variants, n_samples, k) ## Might not work
 
     # Precompute haplotype-only constants
-    sum_h = H_t.sum(1) # (n_variants, k)
+    sum_h = H_t.sum(1)
     HtH   = H_t.transpose(1, 2) @ H_t
 
     # Genotype scalars
-    sum_g  = G_t.sum(1) # (n_variants,)
+    sum_g  = G_t.sum(1)
     sum_g2 = (G_t**2).sum(1)
     sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)
 
     # Assemble XtX per variant
-    XtX = torch.empty((n_variants, 2 + k, 2 + k),
-                      device=G_t.device, dtype=G_t.dtype)
+    p = 2 + k
+    XtX = torch.empty((n_variants, p, p), device=G_t.device, dtype=G_t.dtype)
     XtX[:, 0, 0]   = n_samples
     XtX[:, 0, 1]   = XtX[:, 1, 0] = sum_g
     XtX[:, 1, 1]   = sum_g2
@@ -319,69 +416,59 @@ def calculate_corr_paired(
     XtX[:, 2:, 2:] = HtH
 
     # Assemble XtY
-    if Y_t.shape[0] == 1:
-        y = Y_t.view(-1)
-        XtY = torch.cat([
-            y.sum().expand(n_variants, 1),      # (n_variants, 1)
-            (G_t * y).sum(1, keepdim=True),     # (n_variants, 1)
-            torch.einsum("s,vsk->vk", y, H_t)   # (n_variants, k)
-        ], dim=1).unsqueeze(-1)                 # (n_variants, 2 + k, 1)
-    elif Y_t.shape[0] == n_variants:
-        XtY = torch.cat([
-            Y_t.sum(1, keepdim=True),
-            (G_t * Y_t).sum(1, keepdim=True),
-            torch.einsum("vs,vsk->vk", Y_t, H_t)
-        ], dim=1).unsqueeze(-1)
-    else:
-        raise ValueError(f"bad Y_t shape {Y_t.shape}")
+    sum_y  = Y_t.sum(1)
+    sum_gy = G_t @ Y_t.T
+    sum_hy = torch.einsum("vsk,ps->vpk", H_t, Y_t)
+
+    XtY = torch.empty((n_variants, n_pheno, p, 1), device=G_t.device)
+    XtY[:, :, 0, 0] = sum_y.unsqueeze(0).expand(n_variants, -1)
+    XtY[:, :, 1, 0] = sum_gy
+    XtY[:, :, 2:, 0] = sum_hy
 
     # Solve normal equations
     if use_pinv:
         XtX_inv = torch.linalg.pinv(XtX)
         beta = (XtX_inv @ XtY).squeeze(-1)
-        inv_XtX = XtX_inv
     else:
         try:
             L = torch.linalg.cholesky(XtX)
-            beta = torch.cholesky_solve(XtY, L).squeeze(-1) # solve for β
-            inv_XtX = torch.cholesky_inverse(L)             # (XtX)⁻¹ from same factorization
+            Z = torch.linalg.solve_triangular(L.unsqueeze(1), XtY, upper=False)
+            beta = torch.linalg.solve_triangular(L.transpose(-1, -2).unsqueeze(1), Z, upper=True)
+            beta = beta.squeeze(-1)
+            XtX_inv = torch.cholesky_inverse(L)
         except RuntimeError: # Fallback to pinv
             XtX_inv = torch.linalg.pinv(XtX)
             beta = (XtX_inv @ XtY).squeeze(-1)
 
     # RSS
-    if Y_t.shape[0] == 1:
-        rss = y.pow(2).sum() - (beta.unsqueeze(1) @ XtY).squeeze()
-    else:
-        rss = Y_t.pow(2).sum(1) - (beta.unsqueeze(1) @ XtY).squeeze()
+    rss = Y_t.pow(2).sum(1) - (beta.unsqueeze(1) @ XtY).squeeze()
 
     # Degrees of freedom
-    p = 2 + k
     if dof_vector is not None:
-        dof = dof_vector.to(G_t.device)
+        dof = dof_vector.to(G_t.device).view(-1, 1)
     elif residualizer is not None and hasattr(residualizer, "dof"):
-        dof = torch.full((n_variants,), float(residualizer.dof),
-                         device=G_t.device)
+        dof = torch.full((n_variants, 1), float(residualizer.dof), device=G_t.device)
     else:
-        dof = G_t.new_full((n_variants,), n_samples - p)
+        dof = G_t.new_full((n_variants, 1), n_samples - p)
 
     # Residual variance
     if (dof <= 0).any():
         raise ValueError(f"Degrees of freedom <= 0 detected: {dof}")
     sigma2 = rss / dof
 
-    # Variance-covariance of beta
-    var_beta = sigma2.view(-1, 1, 1) * inv_XtX
-    se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2))
+    # SEs
+    se = torch.sqrt(
+        torch.einsum("vnp,vpp->vnp", sigma2.unsqueeze(-1), XtX_inv.diagonal(dim1=1, dim2=2))
+    )
 
     # Extract results
-    beta_g = beta[:, 1]                                # genotype coefficient
-    beta_h = beta[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
-    se_g   = se[:, 1]
+    beta_g = beta[:, :, 1]                                # genotype coefficient
+    beta_h = beta[:, :, 2:] if k > 0 else torch.empty((n_variants, n_pheno, 0), device=beta.device)
+    se_g   = se[:, :, 1]
     tstat_g = beta_g / se_g.clamp(min=1e-8)
 
     if return_se_h:
-        se_h = se[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
+        se_h = se[:, :, 2:] if k > 0 else torch.empty((n_variants, n_pheno, 0), device=beta.device)
         return beta_g, beta_h, tstat_g, se_g, se_h
     else:
         return beta_g, beta_h, tstat_g, se_g
