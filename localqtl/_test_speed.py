@@ -102,8 +102,8 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
     # broadcast XtX: (v,1,2+k,2+k) vs XtY: (v,p,2+k,1)
     L = torch.linalg.cholesky(XtX)
     rhs = XtY.squeeze(-1).transpose(1,2)
-    Z, _ = torch.solve_triangular(L, rhs, upper=False)
-    beta, _ = torch.solve_triangular(L.transpose(-1,-2), Z, upper=True)
+    Z, _ = torch.linalg.solve_triangular(L, rhs, upper=False)
+    beta, _ = torch.linalg.solve_triangular(L.transpose(-1,-2), Z, upper=True)
     beta = beta.transpose(1,2)
 
     return beta
