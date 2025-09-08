@@ -1,23 +1,42 @@
 #!/usr/bin/env python3
 import argparse
-import torch
 import time
-from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+import torch
+import numpy as np
+import pandas as pd
+from torch.profiler import profile, record_function, ProfilerActivity
+
+# import functions under test
+from localqtl.cis import _process_phenotype_window, calculate_corr_paired
+
+
+# ------------------------
+# Dummy helper objects
+# ------------------------
+class DummyIGC:
+    def __init__(self, n_pheno, start=1_000_000):
+        self.phenotype_start = {f"pheno{i}": start for i in range(n_pheno)}
+        self.phenotype_end = {f"pheno{i}": start + 100 for i in range(n_pheno)}
+
+
+def make_mapping_state(n_variants, device):
+    return dict(
+        device=device,
+        af_all=np.random.rand(n_variants),
+        ma_samples_all=np.random.randint(5, 20, n_variants),
+        ma_count_all=np.random.randint(5, 50, n_variants),
+    )
+
 
 # ------------------------
 # CLI arguments
 # ------------------------
-parser = argparse.ArgumentParser(description="Profile calculate_corr_paired with flexible phenotypes")
+parser = argparse.ArgumentParser(description="Profile _process_phenotype_window")
 parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
-parser.add_argument("--variants", type=int, default=50_000)
-parser.add_argument("--samples", type=int, default=1000)
-parser.add_argument("--phenotypes", type=int, default=64,
-                    help="Number of shared phenotypes if --mode=batch")
+parser.add_argument("--variants", type=int, default=10_000)
+parser.add_argument("--samples", type=int, default=500)
+parser.add_argument("--phenotypes", type=int, default=10)
 parser.add_argument("--haps", type=int, default=2)
-parser.add_argument("--mode", default="batch", choices=["batch", "per_variant", "both"],
-                    help="Phenotype layout: batch=(p,s), per_variant=(v,s), both=run both")
-parser.add_argument("--logdir", default="./profiler_log",
-                    help="Directory for TensorBoard traces")
 args = parser.parse_args()
 
 n_variants   = args.variants
@@ -27,120 +46,84 @@ k_haps       = args.haps
 device       = args.device
 
 torch.manual_seed(42)
-
-# ------------------------
-# Generate synthetic data
-# ------------------------
-# Genotypes (variants × samples)
-G_t = torch.randint(0, 3, (n_variants, n_samples),
-                    device=device, dtype=torch.float32)
-
-# Haplotypes (variants × samples × k)
-H_t = torch.rand(n_variants, n_samples, k_haps, device=device)
-if k_haps == 2:  # collapse collinear haplotype
-    H_t = H_t[:, :, :1]
-    k_haps = 1
+np.random.seed(42)
 
 
 # ------------------------
-# Regression function
+# Synthetic data
 # ------------------------
-def calculate_corr_paired_zstack(G_t, H_t, Y_t):
-    """
-    Unified regression:
-      - Y_t (p,s)  : shared phenotypes across variants
-      - Y_t (v,s)  : per-variant phenotypes
-      - Y_t (v,p,s): p phenotypes per variant
-    """
-    n_variants, n_samples = G_t.shape
-    _, _, k = H_t.shape
+# Genotypes: (variants x samples)
+genotypes = torch.randint(0, 3, (n_variants, n_samples), dtype=torch.float32)
 
-    # Normalize Y_t -> (v,p,s)
-    if Y_t.dim() == 2:
-        if Y_t.shape[0] == n_variants:   # (v,s)
-            Y_t = Y_t.unsqueeze(1)       # (v,1,s)
-        else:                            # (p,s)
-            Y_t = Y_t.unsqueeze(0).expand(n_variants, -1, -1)  # (v,p,s)
-    elif Y_t.dim() == 3:
-        pass
-    else:
-        raise ValueError("Y_t must be (p,s), (v,s), or (v,p,s)")
+# Haplotypes: (variants x samples x k)
+haplotypes = torch.rand(n_variants, n_samples, k_haps, dtype=torch.float32)
 
-    n_pheno = Y_t.shape[1]
+# Phenotypes: one vector per phenotype
+phenotypes = [torch.randn(n_samples, dtype=torch.float32) for _ in range(n_phenotypes)]
 
-    # Precompute scalars
-    sum_h = H_t.sum(1)                   # (v,k)
-    HtH   = H_t.transpose(1, 2) @ H_t    # (v,k,k)
-    sum_g  = G_t.sum(1)                  # (v,)
-    sum_g2 = (G_t**2).sum(1)
-    sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)
+# DataFrames
+variant_ids = [f"var{i}" for i in range(n_variants)]
+variant_df = pd.DataFrame({
+    "pos": np.arange(n_variants) + 1,
+}, index=variant_ids)
 
-    XtX = torch.empty((n_variants, 2 + k, 2 + k),
-                      device=G_t.device, dtype=G_t.dtype)
-    XtX[:, 0, 0]   = n_samples
-    XtX[:, 0, 1]   = XtX[:, 1, 0] = sum_g
-    XtX[:, 1, 1]   = sum_g2
-    XtX[:, 0, 2:]  = XtX[:, 2:, 0] = sum_h
-    XtX[:, 1, 2:]  = XtX[:, 2:, 1] = sum_gh
-    XtX[:, 2:, 2:] = HtH
+phenotype_ids = [f"pheno{i}" for i in range(n_phenotypes)]
+phenotype_pos_df = pd.DataFrame({
+    "chr": ["1"] * n_phenotypes,
+    "start": np.arange(n_phenotypes) * 1000 + 1,
+    "end": np.arange(n_phenotypes) * 1000 + 100,
+}, index=phenotype_ids)
 
-    # XtY
-    sum_y  = Y_t.sum(2)                                # (v,p)
-    sum_gy = torch.einsum("vs,vps->vp", G_t, Y_t)      # (v,p)
-    sum_hy = torch.einsum("vsk,vps->vpk", H_t, Y_t)    # (v,p,k)
+covariates_df = pd.DataFrame(np.random.randn(n_samples, 3),
+                             columns=["cov1", "cov2", "cov3"])
 
-    XtY = torch.zeros((n_variants, n_pheno, 2+k), device=G_t.device)
-    XtY[:, :, 0] = sum_y
-    XtY[:, :, 1] = sum_gy
-    XtY[:, :, 2:] = sum_hy
+# mapping_state
+mapping_state = make_mapping_state(n_variants, device)
 
-    XtX = XtX.unsqueeze(1).expand(-1, n_pheno, -1, -1)  # (v,p,2+k,2+k)
-    XtY = XtY.unsqueeze(-1)                             # (v,p,2+k,1)
+# genotype_ix_t: identity mapping for now
+genotype_ix_t = torch.arange(n_variants)
 
-    L = torch.linalg.cholesky(XtX)
-    Z = torch.linalg.solve_triangular(L, XtY, upper=False)
-    beta = torch.linalg.solve_triangular(L.transpose(-1,-2), Z, upper=True)
-    return beta.squeeze(-1)  # (v,p,2+k)
+# rows: [(phenotype, genotypes, g_idx, haplotypes, phenotype_id), ...]
+rows = []
+for pid, pheno in zip(phenotype_ids, phenotypes):
+    g_idx = np.arange(n_variants)  # all variants in window
+    rows.append((pheno, genotypes, g_idx, haplotypes, pid))
 
 
 # ------------------------
-# Profiling helper
+# Profile run
 # ------------------------
-def run_profile(Y_t, tag):
-    print(f"\nProfiling mode={tag}...")
+def run_profile():
+    print("\nProfiling _process_phenotype_window...")
     start = time.time()
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=True,
         profile_memory=True,
-        on_trace_ready=tensorboard_trace_handler(f"{args.logdir}/{tag}")
     ) as prof:
-        # Warm-up
-        for _ in range(3):
-            _ = calculate_corr_paired_zstack(G_t, H_t, Y_t)
-        torch.cuda.synchronize()
-
-        # Timed run
-        with record_function("calculate_corr_paired_zstack"):
-            beta = calculate_corr_paired_zstack(G_t, H_t, Y_t)
-        torch.cuda.synchronize()
+        with record_function("_process_phenotype_window"):
+            out = _process_phenotype_window(
+                rows, DummyIGC(n_phenotypes), genotype_ix_t,
+                variant_df, phenotype_pos_df, covariates_df,
+                residualizer=None, paired_covs_df=None, interaction_t=None,
+                maf_threshold=0.01, interaction_df=None,
+                maf_threshold_interaction=None, run_eigenmt=False,
+                mapping_state=mapping_state
+            )
+        torch.cuda.synchronize() if device == "cuda" else None
         prof.step()
     end = time.time()
 
-    print(f"Runtime ({tag}): {end - start:.2f} sec")
+    print(f"Runtime: {end - start:.2f} sec")
     print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
-    return beta
+    return out
 
 
-# ------------------------
-# Run
-# ------------------------
-if args.mode in ["batch", "both"]:
-    Y_batch = torch.randn(n_phenotypes, n_samples, device=device)
-    run_profile(Y_batch, "batch")
-
-if args.mode in ["per_variant", "both"]:
-    Y_var = torch.randn(n_variants, n_samples, device=device)
-    run_profile(Y_var, "per_variant")
-
-print(f"\nTrace written to {args.logdir}. Run `tensorboard --logdir={args.logdir}` to explore.")
+if __name__ == "__main__":
+    result = run_profile()
+    if result is None:
+        print("No results (all filtered).")
+    else:
+        n_total, merged, _ = result
+        print(f"\nProcessed {n_total} variant–phenotype pairs.")
+        print("Merged keys:", list(merged.keys()))
