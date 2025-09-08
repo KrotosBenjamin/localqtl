@@ -30,7 +30,7 @@ if k_haps == 2:
     k_haps = 1
 
 # Phenotypes (phenotypes × samples)
-Y_t = torch.randn(n_phenotypes, n_samples, device=device)
+Y_t = torch.randn(1, n_samples, device=device)
 
 print(f"Generated test data: {n_variants} variants × {n_samples} samples × {n_phenotypes} phenotypes")
 print(f"Haplotype covariates: {k_haps}")
