@@ -102,7 +102,7 @@ class RFMixReader:
                                               "physical_position": "pos"})
         self.loci["i"] = cudf.Series(range(len(self.loci)))
         self.loci["hap"] = self.loci["chrom"].astype(str) + "_" + self.loci["pos"].astype(str)
-        
+
         # Subset samples
         self.sample_ids = _get_sample_ids(self.g_anc)
         if select_samples is not None:
@@ -342,10 +342,20 @@ class InputGeneratorCis:
             self.window,
             verbose=True,
         )
+
         if drop_ids:
             print(f"    ** dropping {len(drop_ids)} phenotypes without required windows")
             self.phenotype_df = self._drop_by_ids(self.phenotype_df, drop_ids)
             self.phenotype_pos_df = self.phenotype_pos_df.drop(drop_ids)
+
+        self.cis_v_idx = {}
+        for pid, r in self.cis_ranges.items():
+            if r is None:
+                continue
+            v_lb, v_ub = r
+            chrom = self.phenotype_pos_df.at[pid, 'chr']
+            idx_arr = self.chr_variant_dfs[chrom]['index'].to_numpy()[v_lb : v_ub + 1]
+            self.cis_v_idx[pid] = idx_arr.astype(int, copy=False)
 
         # Cache counts
         self.n_phenotypes = int(self._to_pandas(self.phenotype_df).shape[0])
@@ -365,7 +375,7 @@ class InputGeneratorCis:
     def _interpolate_block(block) -> "np.ndarray":
         """
         Interpolate missing values in a 3D haplotype block: (loci, samples, ancestries).
-        
+
         Performs linear interpolation along the loci axis (axis=0) for each (sample, ancestry)
         pair independently. Supports NumPy or CuPy arrays via arr_mod.
 
@@ -477,30 +487,30 @@ class InputGeneratorCis:
             for k, pid in enumerate(phenotype_ids, chr_offset + 1):
                 if verbose:
                     _print_progress(k, self.n_phenotypes, 'phenotype')
-                    
+
                 p = self._row(self.phenotype_df, index_of[pid]).ravel()
-                r = self.cis_ranges[pid]
-                if r is None:
+                v_idx = self.cis_v_idx.get(pid, None)
+                if v_idx is None or v_idx.size == 0:
                     continue
 
-                # Variant  and haplotype slice
-                v_lb, v_ub = r
-                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None)
-                G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
+                G = self._rows(self.genotype_df, v_idx)
+                G_idx = v_idx
 
-                H = None
-                if v_lb is not None and v_ub is not None:
-                    H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
-                    if self.on_the_fly_impute:
-                        H_block = H_slice.compute()
-                        H = self._interpolate_block(H_block)
-                        if H is not None and H.ndim == 3 and H.shape[2] == 1:
-                            H = H.reshape(H.shape[0], H.shape[1])
-                    else:
-                        H = H_slice.compute() # for FLARE input
+                if isinstance(self.haplotypes, (da.Array, zarr.Array, np.ndarray, pd.DataFrame, cuDF)):
+                    H_slice = self.haplotypes[v_idx, :, :]      # (v, samples, k) or (v, samples) if k==1
+                else:
+                    raise TypeError(f"Unsupported haplotype type: {type(self.haplotypes)}")
 
-                if debug:
-                    print(f"[DEBUG] H.shape = {H.shape} | v_lb = {v_lb}, v_ub = {v_ub}")
+                if self.on_the_fly_impute:
+                    H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+                    H = self._interpolate_block(H_block)
+                else:
+                    H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+
+                # Optional squeeze when k==1 for downstream (v, s) shape
+                if H is not None and H.ndim == 3 and H.shape[2] == 1:
+                    H = H.reshape(H.shape[0], H.shape[1])
+
                 yield p, G, G_idx, H, pid
         else:
             # Grouped mode: all phenotypes in group must share ranges or we take union
@@ -513,26 +523,24 @@ class InputGeneratorCis:
                 idxs = [index_of[i] for i in ids]
                 p = self._rows(self.phenotype_df, idxs)
 
-                # Validate identical ranges; if not, take union
-                ranges = [self.cis_ranges[i] for i in ids]
-                v_lbs = [r[0] for r in ranges if r is not None]
-                v_ubs = [r[1] for r in ranges if r is not None]
+                # Union of explicit indices (keeps genomic order from per-chrom pos sort)
+                v_lists = [self.cis_v_idx[i] for i in ids if i in self.cis_v_idx]
+                if not v_lists:
+                    continue
+                v_idx = np.unique(np.concatenate(v_lists)).astype(int, copy=False)
 
-                v_lb, v_ub = (min(v_lbs), max(v_ubs)) if len(v_lbs) else (None, None)
+                G = self._rows(self.genotype_df, v_idx)
+                G_idx = v_idx
 
-                G = self._slice_rows(self.genotype_df, v_lb, (v_ub + 1) if v_ub is not None else None) if v_lb is not None else None
-                G_idx = np.arange(v_lb, v_ub + 1) if v_lb is not None else np.arange(0, 0, dtype=int)
+                H_slice = self.haplotypes[v_idx, :, :]
+                if self.on_the_fly_impute:
+                    H_block = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+                    H = self._interpolate_block(H_block)
+                else:
+                    H = H_slice.compute() if hasattr(H_slice, "compute") else np.asarray(H_slice)
+                if H is not None and H.ndim == 3 and H.shape[2] == 1:
+                    H = H.reshape(H.shape[0], H.shape[1])
 
-                H = None
-                if v_lb is not None and v_ub is not None:
-                    H_slice = self.haplotypes[v_lb:v_ub + 1, :, :] # dask array slice
-                    if self.on_the_fly_impute:
-                        H_block = H_slice.compute()
-                        H = self._interpolate_block(H_block)
-                        if H is not None and H.ndim == 3 and H.shape[2] == 1:
-                            H = H.reshape(H.shape[0], H.shape[1])
-                    else:
-                        H = H_slice.compute() # FLARE compatible
                 yield p, G, G_idx, H, ids, group_id
 
 
