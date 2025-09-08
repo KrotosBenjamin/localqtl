@@ -335,7 +335,8 @@ def _merge_results(chr_res, chr_block, start, n_i):
         if isinstance(chr_res[k], list):
             chr_res[k].extend(v)
         else:
-            v = np.asarray(v)
+            if not isinstance(v, np.ndarray):
+                v = np.asarray(v)
             # If 2D and target is 1D, flatten if second dim == 1
             if v.ndim == 2 and chr_res[k].ndim == 1:
                 if v.shape[1] == 1:
@@ -419,7 +420,7 @@ def _write_chromosome_results(
     # Apply t-to-p conversion
     if interaction_df is None:
         if 'pval_nominal' in chr_res_df.columns:
-            mask = chr_res_df['pval_nominal'].notnull()
+            mask = np.isfinite(chr_res_df['pval_nominal'].to_numpy())
             chr_res_df.loc[mask, 'pval_nominal'] = get_t_pval(
                 chr_res_df.loc[mask, 'pval_nominal'], idof if isinstance(idof, int) else idof[mask], log=logp
             )
@@ -428,13 +429,13 @@ def _write_chromosome_results(
             ni = interaction_df.shape[1]
         if ni == 1:
             for col in ['pval_g', 'pval_i', 'pval_gi']:
-                mask = chr_res_df[col].notnull()
+                mask = np.isfinite(chr_res_df[col].to_numpy())
                 chr_res_df.loc[mask, col] = get_t_pval(
                     chr_res_df.loc[mask, col], idof if isinstance(idof, int) else idof[mask], log=logp
                 )
         else:
             # Apply per-interaction column p-value adjustment
-            mask = chr_res_df['pval_g'].notnull()
+            mask = np.infinite(chr_res_df['pval_g'].to_numpy())
             chr_res_df.loc[mask, 'pval_g'] = get_t_pval(
                 chr_res_df.loc[mask, 'pval_g'], idof if isinstance(idof, int) else idof[mask], log=logp
             )

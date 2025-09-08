@@ -159,15 +159,6 @@ class RFMixReader:
         """Force-load haplotype ancestry into memory as NumPy array."""
         return self.haplotypes.compute()
 
-    # @staticmethod
-    # def _filter_zarr(zarr_in: str, zarr_out: str, indices: np.ndarray,
-    #                  chunk_size: int = 10_000):
-    #     """Write a filtered Zarr containing only rows at given indices."""
-    #     daz = from_zarr(zarr_in)
-    #     dst = daz[indices, :, :]
-    #     dst = dst.rechunk((chunk_size, -1, -1))
-    #     dst.to_zarr(zarr_out, overwrite=True)
-
 # -------------------------------------------------
 # cis-window computation for variants + haplotypes
 # -------------------------------------------------
@@ -388,29 +379,26 @@ class InputGeneratorCis:
         arr_mod.ndarray
             Same shape as input, with NaNs interpolated (and rounded to integers).
         """
-        if 'cupy' in str(type(block)):
-            mod = cp
-        else:
-            mod = np
+        # Determine arrray module
+        mod = cp.get_array_module(block) if cp and isinstance(block, cp.ndarray) else np
+
+        loci_dim, sample_dim, ancestry_dim = block.shape
+        block = block.reshape(loci_dim, -1)  # Shape: (loci, samples * ancestries)
+        idx = mod.arange(loci_dim)
 
         block_imputed = block.copy()
-        loci_dim, sample_dim, ancestry_dim = block.shape
 
         for s in range(sample_dim):
-            for a in range(ancestry_dim):
-                col = block[:, s, a]
-                mask = mod.isnan(col)
-                if mod.any(mask):
-                    idx = mod.arange(loci_dim)
-                    valid = ~mask
-                    if mod.any(valid):
-                        # Linear interpolation and rounding
-                        interpolated = mod.round(
-                            mod.interp(idx[mask], idx[valid], col[valid])
-                        )
-                        col[mask] = interpolated.astype(int)
-                block_imputed[:, s, a] = col
-        return block_imputed
+            col = block[:, s]
+            mask = mod.isnan(col)
+            if mod.any(mask):
+                valid = ~mask
+                if mod.any(valid):
+                    # Linear interpolation and rounding
+                    interpolated = mod.interp(idx[mask], idx[valid], col[valid])
+                    block_imputed[mask, s] = mod.round(interpolated).astype(int)
+
+        return block_imputed.reshape(loci_dim, sample_dim, ancestry_dim)
 
     # ----------------------------
     # Dask-aware row slicers

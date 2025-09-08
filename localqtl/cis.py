@@ -42,61 +42,62 @@ def map_nominal(genotype_df, variant_df, phenotype_df, phenotype_pos_df, prefix,
     write_top is set to False, in which case it is returned as a DataFrame
     """
     msg='cis-QTL mapping: nominal associations for all variant-phenotype pairs'
-    mapping_state = _setup_mapping_inputs(
-        phenotype_df, covariates_df, paired_covariate_df, phenotype_pos_df,
-        maf_threshold, interaction_df=interaction_df,
-        maf_threshold_interaction=maf_threshold_interaction, logger=logger,
-        group_s=group_s, msg=msg, verbose=verbose
-    )
-    phenotype_df = mapping_state["phenotype_df"]
-    phenotype_pos_df = mapping_state["phenotype_pos_df"]
-    group_s = mapping_state["group_s"]
-    sample_ids = phenotype_df.columns.tolist()
+    with torch.no_grad():
+        mapping_state = _setup_mapping_inputs(
+            phenotype_df, covariates_df, paired_covariate_df, phenotype_pos_df,
+            maf_threshold, interaction_df=interaction_df,
+            maf_threshold_interaction=maf_threshold_interaction, logger=logger,
+            group_s=group_s, msg=msg, verbose=verbose
+        )
+        phenotype_df = mapping_state["phenotype_df"]
+        phenotype_pos_df = mapping_state["phenotype_pos_df"]
+        group_s = mapping_state["group_s"]
+        sample_ids = phenotype_df.columns.tolist()
     
-    _log_mapping_context(
-        genotype_df, haplotypes, group_s, window,
-        None, mapping_state["logger"]
-    )
-    # Add precomputed allele stats
-    af_all, maf_all, ma_samples_all, ma_count_all = \
-        precompute_allele_stats(genotype_df, device=mapping_state["device"])
-    mapping_state.update({
-        "af_all": af_all, "maf_all": maf_all,
-        "ma_samples_all": ma_samples_all, "ma_count_all": ma_count_all
-    })
-
-    igc = haplotypeio.InputGeneratorCis(
-        genotype_df, variant_df, phenotype_df, phenotype_pos_df,
-        haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
-        loci_df if loci_df is not None else pd.DataFrame(index=[]),
-        group_s=group_s, window=window, require_both=require_both,
-        on_the_fly_impute = on_the_fly_impute,
-    )
-
-    best_assoc = []
-    start_time = time.time()
-    for chrom in igc.chrs:
-        chr_res, top_hits = _map_chromosome(
-            chrom, igc, variant_df, phenotype_pos_df, mapping_state,
-            group_s, genotype_df, sample_ids, maf_threshold, interaction_df,
-            maf_threshold_interaction, logp, run_eigenmt, verbose, start_time,
-            covariates_df
+        _log_mapping_context(
+            genotype_df, haplotypes, group_s, window,
+            None, mapping_state["logger"]
         )
-        if write_stats:
-            _write_chromosome_results(
-                chr_res, chrom, variant_df, prefix, output_dir,
-                interaction_df, logp, paired_covariate_df, mapping_state
+        # Add precomputed allele stats
+        af_all, maf_all, ma_samples_all, ma_count_all = \
+            precompute_allele_stats(genotype_df, device=mapping_state["device"])
+        mapping_state.update({
+            "af_all": af_all, "maf_all": maf_all,
+            "ma_samples_all": ma_samples_all, "ma_count_all": ma_count_all
+        })
+
+        igc = haplotypeio.InputGeneratorCis(
+            genotype_df, variant_df, phenotype_df, phenotype_pos_df,
+            haplotypes if haplotypes is not None else pd.DataFrame(index=[]),
+            loci_df if loci_df is not None else pd.DataFrame(index=[]),
+            group_s=group_s, window=window, require_both=require_both,
+            on_the_fly_impute = on_the_fly_impute,
+        )
+
+        best_assoc = []
+        start_time = time.time()
+        for chrom in igc.chrs:
+            chr_res, top_hits = _map_chromosome(
+                chrom, igc, variant_df, phenotype_pos_df, mapping_state,
+                group_s, genotype_df, sample_ids, maf_threshold, interaction_df,
+                maf_threshold_interaction, logp, run_eigenmt, verbose, start_time,
+                covariates_df
             )
-        if top_hits:
-            best_assoc.extend(top_hits)
+            if write_stats:
+                _write_chromosome_results(
+                    chr_res, chrom, variant_df, prefix, output_dir,
+                    interaction_df, logp, paired_covariate_df, mapping_state
+                )
+            if top_hits is not None:
+                best_assoc.extend(top_hits)
 
-    if interaction_df is not None and best_assoc:
-        return _summarize_top_associations(
-            best_assoc, interaction_df, logp, run_eigenmt,
-            write_top, output_dir, prefix, mapping_state, group_s
-        )
+            if interaction_df is not None and best_assoc:
+                return _summarize_top_associations(
+                    best_assoc, interaction_df, logp, run_eigenmt,
+                    write_top, output_dir, prefix, mapping_state, group_s
+                )
 
-    mapping_state['logger'].write('done.')
+        mapping_state['logger'].write('done.')
 
 
 def map_cis(genotype_df, variant_df, phenotype_df, phenotype_pos_df,

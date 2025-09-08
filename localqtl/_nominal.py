@@ -81,8 +81,8 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
 
     # Iterate windows
-    for batch_rows in _batch_generator(igc.generate_data(chrom=chrom, verbose=verbose),
-                                       device=mapping_state["device"]):
+    for batch_idx, batch_rows in enumerate(_batch_generator(igc.generate_data(chrom=chrom, verbose=verbose),
+                                                            device=mapping_state["device"])):
         process_fnc = _process_grouped_phenotype_window if group_s is not None else _process_phenotype_window
         results = process_fnc(
             batch_rows, igc, genotype_ix_t, variant_df, phenotype_pos_df,
@@ -101,7 +101,7 @@ def _map_chromosome(chrom, igc, variant_df, phenotype_pos_df, mapping_state,
         start += n_i
 
         del batch_rows, results, chr_block
-        if device == "cuda":
+        if torch.cuda.is_available() and batch_idx % 250 == 0:
             torch.cuda.empty_cache()
 
     logger.write(f'    time elapsed: {(time.time()-start_time)/60:.2f} min')

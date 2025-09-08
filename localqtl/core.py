@@ -99,13 +99,23 @@ class Residualizer(object):
         # Center and orthogonalize covariates
         C_t = C_t - C_t.mean(0)
         self.Q_t, _ = torch.linalg.qr(C_t, mode='reduced')
+        self.P = self.Q_t @ self.Q_t.T
+        # Always reserving space for G and intercept (probably)
         self.dof = C_t.shape[0] - 2 - C_t.shape[1]
 
     def transform(self, M_t: torch.Tensor, center: bool=True) -> torch.Tensor:
-        """Residualize rows of M wrt columns of C"""
+        """
+        Residualize each row of a matrix with respect to covariates.
+
+        Given a matrix M (n_rows x n_features), this function removes
+        the linear effects of covariates C from each row of M:
+            M_resid = M - M @ Q @ Q^T
+
+        If center=True, M is mean-centered across columns before projection.
+        """
         if center:
             M_t = M_t - M_t.mean(dim=1, keepdim=True)
-        return M_t - torch.mm(torch.mm(M_t, self.Q_t), self.Q_t.T)
+        return M_t - M_t @ self.P
 
 
 def center_normalize(M_t: torch.Tensor, dim: int=0) -> torch.Tensor:
@@ -141,7 +151,7 @@ def precompute_allele_stats(genotype_df, device="cpu"):
     ma_samples_t = torch.where(ix_t, a, b)
 
     # Minor allele total counts
-    a = (genotypes_all_t * m.float()).sum(1).int()
+    a = torch.sum(genotypes_all_t.masked_fill(~m, 0.0), dim=1).int()
     ma_count_t = torch.where(ix_t, a, n2 - a)
 
     # Move to CPU numpy arrays for fast indexing
@@ -259,111 +269,111 @@ def calculate_corr_paired(
     se_g: Standard error of genotype coefficient.
     se_h: Standard error of haplotype coefficients (if return_se_h is True).
     """
-    with torch.no_grad():
-        n_variants, n_samples = G_t.shape
+    n_variants, n_samples = G_t.shape
 
-        # Haplotype handling
-        if H_t.ndim == 2: # Shared across
-            H_shared = True
-            H_t = H_t.unsqueeze(2)  # (n_variants x n_samples x 1)
-        elif H_t.ndim != 3: # variant-specific
-            raise ValueError(f"H_t must be 2D or 3D, got shape {H_t.shape}")
-        _, _, k = H_t.shape
+    # Haplotype handling
+    if H_t.ndim == 2: # Shared across
+        H_t = H_t.unsqueeze(2)  # (n_variants x n_samples x 1)
+    elif H_t.ndim != 3: # variant-specific
+        raise ValueError(f"H_t must be 2D or 3D, got shape {H_t.shape}")
+    _, _, k = H_t.shape
 
-        # Residualization if needed
-        if residualizer is not None:
-            G_t = residualizer.transform(G_t)
-            Y_t = residualizer.transform(Y_t)
-            H_t = torch.stack(
-                [residualizer.transform(H_t[i].T) for i in range(H_t.shape[0])],
-                dim=0
-            ).reshape(n_variants, n_samples, k)
+    # Residualization if needed
+    if residualizer is not None:
+        G_t = residualizer.transform(G_t)
+        Y_t = residualizer.transform(Y_t)
+        H_t = torch.stack(
+            [residualizer.transform(H_t[i].T) for i in range(H_t.shape[0])],
+            dim=0
+        ).reshape(n_variants, n_samples, k)
 
-        # Build X'X blockwise
-        ones = torch.ones((n_samples,), device=G_t.device, dtype=G_t.dtype)
+    # Build X'X blockwise
+    ones = torch.ones((n_samples,), device=G_t.device, dtype=G_t.dtype)
 
-        # Precompute haplotype-only constants
-        sum_h = H_t.sum(1) # (n_variants, k)
-        HtH   = torch.einsum("vsk,vsm->vkm", H_t, H_t)
+    # Precompute haplotype-only constants
+    sum_h = H_t.sum(1) # (n_variants, k)
+    HtH   = torch.einsum("vsk,vsm->vkm", H_t, H_t)
 
-        # Genotype scalars
-        sum_g  = G_t.sum(1) # (n_variants,)
-        sum_g2 = (G_t**2).sum(1)
-        sum_gh = torch.einsum("vs,vsk->vk", G_t, H_t)
+    # Genotype scalars
+    sum_g  = G_t.sum(1) # (n_variants,)
+    sum_g2 = (G_t**2).sum(1)
+    sum_gh = torch.einsum("vs,vsk->vk", G_t, H_t)
 
-        # Assemble XtX per variant
-        XtX = torch.zeros((n_variants, 2 + k, 2 + k),
-                          device=G_t.device, dtype=G_t.dtype)
-        XtX[:, :2, :2] = torch.stack([
-            torch.stack([torch.full_like(sum_g, n_samples), sum_g], dim=1),
-            torch.stack([sum_g, sum_g2], dim=1)
-        ], dim=1)
-        XtX[:, 0, 2:] = sum_h
-        XtX[:, 2:, 0] = sum_h
-        XtX[:, 1, 2:] = sum_gh
-        XtX[:, 2:, 1] = sum_gh
-        XtX[:, 2:, 2:] = HtH
+    # Assemble XtX per variant
+    XtX = torch.zeros((n_variants, 2 + k, 2 + k),
+                      device=G_t.device, dtype=G_t.dtype)
+    XtX[:, 0, 0] = n_samples
+    XtX[:, 0, 1] = XtX[:, 1, 0] = sum_g
+    XtX[:, 1, 1] = sum_g2
+    XtX[:, 0, 2:] = XtX[:, 2:, 0] = sum_h
+    XtX[:, 1, 2:] = XtX[:, 2:, 1] = sum_gh
+    XtX[:, 2:, 2:] = HtH
 
-        # Assemble XtY
-        if Y_t.shape[0] == 1:
-            y = Y_t.squeeze(0)                   # (n_samples,)
-            sum_y = y.sum().expand(n_variants)   # scalar repeated
-            sum_gy = (G_t * y).sum(1)
-            sum_hy = torch.einsum("vs,vsk->vk", y, H_t)
-        elif Y_t.shape[0] == n_variants:
-            sum_y = Y_t.sum(1)
-            sum_gy = (G_t * Y_t).sum(1)
-            sum_hy = torch.einsum("vs,vsk->vk", Y_t, H_t)
-        else:
-            raise ValueError(f"bad Y_t shape {Y_t.shape}")
+    # Assemble XtY
+    if Y_t.shape[0] == 1:
+        XtY = torch.cat([
+            y.sum().view(1).expand(n_variants, 1),        # (n_variants, 1)
+            (G_t * y).sum(1, keepdim=True),           # (n_variants, 1)
+            torch.einsum("s,vsk->vk", y, H_t)         # (n_variants, k)
+        ], dim=1).unsqueeze(-1)                       # (n_variants, 2 + k, 1)
+    elif Y_t.shape[0] == n_variants:
+        XtY = torch.cat([
+            Y_t.sum(1),
+            (G_t * Y_t).sum(1),
+            torch.einsum("vs,vsk->vk", Y_t, H_t)
+        ], dim=1).unsqueeze(-1)
+    else:
+        raise ValueError(f"bad Y_t shape {Y_t.shape}")
 
-        XtY = torch.stack([sum_y, sum_gy], dim=1)   # (n_variants, 2)
-        XtY = torch.cat([XtY, sum_hy], dim=1)       # (n_variants, 2+k)
-        XtY = XtY.unsqueeze(-1) 
-
-        # Solve normal equations
-        if use_pinv:
+    # Solve normal equations
+    if use_pinv:
+        XtX_inv = torch.linalg.pinv(XtX)
+        beta = (XtX_inv @ XtY).squeeze(-1)
+        inv_XtX = XtX_inv
+    else:
+        try:
+            beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
+            inv_XtX = torch.linalg.inv(XtX)
+        except RuntimeError: # Fallback to pinv
             XtX_inv = torch.linalg.pinv(XtX)
             beta = (XtX_inv @ XtY).squeeze(-1)
-        else:
-            beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
             
-        # RSS
-        if Y_t.shape[0] == 1:
-            y2 = (y**2).sum()
-            rss = y2 - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
-        else:
-            y2 = (Y_t**2).sum(1)
-            rss = y2 - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
+    # RSS
+    if Y_t.shape[0] == 1:
+        rss = y.pow(2).sum() - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
+    else:
+        rss = Y_t.pow(2).sum(1) - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
         
-        # Degrees of freedom
-        p = 2 + k
-        if dof_vector is not None:
-            dof = dof_vector.to(G_t.device)
-        elif residualizer is not None and hasattr(residualizer, "dof"):
-            dof = torch.full((n_variants,), float(residualizer.dof),
-                             device=G_t.device)
-        else:
-            dof = G_t.new_full((n_variants,), n_samples - p)
+    # Degrees of freedom
+    p = 2 + k
+    if dof_vector is not None:
+        dof = dof_vector.to(G_t.device)
+    elif residualizer is not None and hasattr(residualizer, "dof"):
+        dof = torch.full((n_variants,), float(residualizer.dof),
+                         device=G_t.device)
+    else:
+        dof = G_t.new_full((n_variants,), n_samples - p)
 
-        # Residual variance
-        sigma2 = rss / dof
+    # Residual variance
+    if (dof <= 0).any():
+        raise ValueError(f"Degrees of freedom <= 0 detected: {dof}")
+    sigma2 = rss / dof
 
-        # Variance-covariance of beta
-        var_beta = sigma2.view(-1, 1, 1) * torch.linalg.inv(XtX)
-        se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2))
+    # Variance-covariance of beta
+    var_beta = sigma2.view(-1, 1, 1) * inv_XtX
+    se = torch.sqrt(torch.diagonal(var_beta, dim1=1, dim2=2))
 
-        # Extract results
-        beta_g = beta[:, 1]                                # genotype coefficient
-        beta_h = beta[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
-        se_g   = se[:, 1]
-        tstat_g = beta_g / se_g.clamp(min=1e-8)
+    # Extract results
+    beta_g = beta[:, 1]                                # genotype coefficient
+    beta_h = beta[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
+    se_g   = se[:, 1]
+    tstat_g = beta_g / se_g.clamp(min=1e-8)
 
-        if return_se_h:
-            se_h = se[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
-            return beta_g, beta_h, tstat_g, se_g, se_h
-        else:
-            return beta_g, beta_h, tstat_g, se_g
+    if return_se_h:
+        se_h = se[:, 2:] if k > 0 else torch.empty((n_variants, 0), device=beta.device)
+        return beta_g, beta_h, tstat_g, se_g, se_h
+    else:
+        return beta_g, beta_h, tstat_g, se_g
 
 
 def get_t_pval(t, df, log=False):
@@ -389,7 +399,7 @@ def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
     using chunked memory-efficient processing.
     """
     # Ensure phenotypes is 2D and float32
-    phenotype_t = phenotype_t.view(1, -1).float()
+    phenotype_t = phenotype_t.unsqueeze(0).float()
 
     if haplotypes_t is None:
     # Correlation and variance components
@@ -398,11 +408,11 @@ def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
                                          return_var=True)
         dof = residualizer.dof if residualizer is not None else phenotype_t.shape[1] - 2
         dof = float(dof)
-        r2_t = r_nominal_t ** 2
-        std_ratio_t = torch.sqrt(phenotype_var_t / genotype_var_t).clamp(min=1e-8)
-        beta_g = r_nominal_t * std_ratio_t
-        tstat_g = r_nominal_t * torch.sqrt(dof / (1.0 - r2_t).clamp(min=1e-8))
-        se_g = slope_t / tstat_t.clamp(min=1e-8)
+        r2_t = r ** 2
+        std_ratio_t = torch.sqrt(p_var / g_var).clamp(min=1e-8)
+        beta_g = r * std_ratio_t
+        tstat_g = r * torch.sqrt(dof / (1.0 - r2_t).clamp(min=1e-8))
+        se_g = beta_g / tstat_g.clamp(min=1e-8)
         beta_h, se_h = None
     else:
         beta_g, beta_h, tstat_g, se_g, se_h = calculate_corr_paired(
