@@ -340,7 +340,7 @@ def calculate_corr_paired_windows(
 
 
 def calculate_corr_paired(
-        G_t, H_t, Y_t, residualizer=None, use_pinv=False,
+        G_t, H_t, Y_t, residualizer=None,
         return_se_h=True, dof_vector=None,
 ):
     """
@@ -431,23 +431,25 @@ def calculate_corr_paired(
     XtY[:, :, 1, 0] = sum_gy
     XtY[:, :, 2:, 0] = sum_hy
 
-    # Solve normal equations
-    if use_pinv:
+    # Ridge stability
+    eps = 1e-8
+    I = torch.eye(p, device=G_t.device, dtype=G_t.dtype).expand(n_variants, -1, -1)
+    XtX = XtX + eps * I
+
+    try:
+        L = torch.linalg.cholesky(XtX)
+        Z = torch.linalg.solve_triangular(L.unsqueeze(1), XtY, upper=False)
+        beta = torch.linalg.solve_triangular(L.transpose(-1, -2).unsqueeze(1), Z, upper=True)
+        beta = beta.squeeze(-1)
+        XtX_inv = torch.cholesky_inverse(L)
+    except RuntimeError: # Fallback to pinv
         XtX_inv = torch.linalg.pinv(XtX)
         beta = (XtX_inv @ XtY).squeeze(-1)
-    else:
-        try:
-            L = torch.linalg.cholesky(XtX)
-            Z = torch.linalg.solve_triangular(L.unsqueeze(1), XtY, upper=False)
-            beta = torch.linalg.solve_triangular(L.transpose(-1, -2).unsqueeze(1), Z, upper=True)
-            beta = beta.squeeze(-1)
-            XtX_inv = torch.cholesky_inverse(L)
-        except RuntimeError: # Fallback to pinv
-            XtX_inv = torch.linalg.pinv(XtX)
-            beta = (XtX_inv @ XtY).squeeze(-1)
 
     # RSS
-    rss = Y_t.pow(2).sum(1) - (beta.unsqueeze(1) @ XtY).squeeze()
+    y2 = Y_t.pow(2).sum(1).unsqueeze(0).expand(n_variants, -1)
+    cross = (beta * XtY.squeeze(-1)).sum(-1)
+    rss = y2 - cross
 
     # Degrees of freedom
     if dof_vector is not None:
@@ -463,9 +465,7 @@ def calculate_corr_paired(
     sigma2 = rss / dof
 
     # SEs
-    se = torch.sqrt(
-        torch.einsum("vnp,vpp->vnp", sigma2.unsqueeze(-1), XtX_inv.diagonal(dim1=1, dim2=2))
-    )
+    se = torch.sqrt(sigma2.unsqueeze(-1) * XtX_inv.diagonal(dim1=1, dim2=2).unsqueeze(1))
 
     # Extract results
     beta_g = beta[:, :, 1]                                # genotype coefficient
@@ -521,7 +521,7 @@ def calculate_cis_nominal(genotypes_t, phenotype_t, residualizer=None,
     else:
         beta_g, beta_h, tstat_g, se_g, se_h = calculate_corr_paired(
             genotypes_t, haplotypes_t, phenotype_t, residualizer=residualizer,
-            return_se_h=True, use_pinv=True) # Turn off to increase speed
+            return_se_h=True) # Turn off to increase speed
 
     return tstat_g, beta_g, se_g, beta_h, se_h
     ## Allele frequency stats for variants only
