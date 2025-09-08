@@ -101,8 +101,7 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
     # Solve per phenotype: vectorized
     # broadcast XtX: (v,1,2+k,2+k) vs XtY: (v,p,2+k,1)
     L = torch.linalg.cholesky(XtX)
-    L = L.unsqueeze(1).expand(-1, n_pheno, -1, -1)
-    beta = torch.cholesky_solve(XtY, L).squeeze(-1) # solve for β
+    beta = torch.cholesky_solve(XtY, L.unsqueeze(1)).squeeze(-1)
 
     return beta
 
