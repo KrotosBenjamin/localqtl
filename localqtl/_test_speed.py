@@ -7,7 +7,8 @@ import pandas as pd
 from torch.profiler import profile, record_function, ProfilerActivity
 
 # import functions under test
-from localqtl.cis import _process_phenotype_window, calculate_corr_paired
+from _nominal import _process_phenotype_window
+from core import calculate_corr_paired
 
 
 # ------------------------
