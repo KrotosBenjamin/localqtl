@@ -66,19 +66,26 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
     n_pheno = Y_t.shape[0]
     _, _, k = H_t.shape
 
-    # Cross-products for design (same across phenotypes)
-    sum_h  = H_t.sum(1)                      # (v,k)
-    HtH    = H_t.transpose(1, 2) @ H_t       # (v,k,k)
-    sum_g  = G_t.sum(1)                      # (v,)
-    sum_g2 = (G_t**2).sum(1)
-    sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)  # (v,k)
+    # Build X'X blockwise
+    ones = torch.ones((n_samples,), device=G_t.device, dtype=G_t.dtype)
 
-    XtX = torch.zeros((n_variants, 2+k, 2+k), device=G_t.device)
-    XtX[:, 0, 0] = n_samples
-    XtX[:, 0, 1] = XtX[:, 1, 0] = sum_g
-    XtX[:, 1, 1] = sum_g2
-    XtX[:, 0, 2:] = XtX[:, 2:, 0] = sum_h
-    XtX[:, 1, 2:] = XtX[:, 2:, 1] = sum_gh
+    # Precompute haplotype-only constants
+    sum_h = H_t.sum(1) # (n_variants, k)
+    HtH   = H_t.transpose(1, 2) @ H_t
+
+    # Genotype scalars
+    sum_g  = G_t.sum(1) # (n_variants,)
+    sum_g2 = (G_t**2).sum(1)
+    sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)
+
+    # Assemble XtX per variant
+    XtX = torch.empty((n_variants, 2 + k, 2 + k),
+                      device=G_t.device, dtype=G_t.dtype)
+    XtX[:, 0, 0]   = n_samples
+    XtX[:, 0, 1]   = XtX[:, 1, 0] = sum_g
+    XtX[:, 1, 1]   = sum_g2
+    XtX[:, 0, 2:]  = XtX[:, 2:, 0] = sum_h
+    XtX[:, 1, 2:]  = XtX[:, 2:, 1] = sum_gh
     XtX[:, 2:, 2:] = HtH
 
     # Now build XtY for all phenotypes at once
@@ -96,9 +103,9 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
 
     # Solve per phenotype: vectorized
     # broadcast XtX: (v,1,2+k,2+k) vs XtY: (v,p,2+k,1)
-    beta = torch.linalg.solve(
-        XtX.unsqueeze(1), XtY
-    ).squeeze(-1)  # (v,p,2+k)
+    L = torch.linalg.cholesky(XtX)
+    beta = torch.cholesky_solve(XtY, L).squeeze(-1) # solve for β
+    inv_XtX = torch.cholesky_inverse(L)             # (XtX)⁻¹ from same factorization
 
     return beta
 
