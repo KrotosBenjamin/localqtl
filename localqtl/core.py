@@ -311,8 +311,9 @@ def calculate_corr_paired(
 
     # Assemble XtY
     if Y_t.shape[0] == 1:
+        y = Y_t.squeeze(0)                            # (n_samples,)
         XtY = torch.cat([
-            y.sum().view(1).expand(n_variants, 1),        # (n_variants, 1)
+            y.sum().view(1).expand(n_variants, 1),    # (n_variants, 1)
             (G_t * y).sum(1, keepdim=True),           # (n_variants, 1)
             torch.einsum("s,vsk->vk", y, H_t)         # (n_variants, k)
         ], dim=1).unsqueeze(-1)                       # (n_variants, 2 + k, 1)
