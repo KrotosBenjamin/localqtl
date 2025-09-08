@@ -30,7 +30,7 @@ def _unpack_hap_effects(beta_h, se_h, prefix="beta_h", se_prefix="se_h"):
     }
 
 
-def _batch_generator(iterable, start_size=128, max_size=1024,
+def _batch_generator(iterable, start_size=256, max_size=2048,
                      grow_factor=2, shrink_factor=0.5,
                      device="cuda"):
     """
