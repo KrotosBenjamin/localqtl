@@ -279,7 +279,7 @@ def calculate_corr_paired(
             raise ValueError(f"bad Y_t shape {Y_t.shape}")
     else:
         raise ValueError(f"bad Y_t ndim {Y_t.ndim}, shape={Y_t.shape}")
-    
+
     # Haplotype handling
     if H_t.ndim == 2: # Shared across
         H_t = H_t.unsqueeze(2)  # (n_variants x n_samples x 1)
@@ -301,21 +301,21 @@ def calculate_corr_paired(
 
     # Precompute haplotype-only constants
     sum_h = H_t.sum(1) # (n_variants, k)
-    HtH   = torch.einsum("vsk,vsm->vkm", H_t, H_t)
+    HtH   = H_t.transpose(1, 2) @ H_t
 
     # Genotype scalars
     sum_g  = G_t.sum(1) # (n_variants,)
     sum_g2 = (G_t**2).sum(1)
-    sum_gh = torch.einsum("vs,vsk->vk", G_t, H_t)
+    sum_gh = torch.bmm(G_t.unsqueeze(1), H_t).squeeze(1)
 
     # Assemble XtX per variant
-    XtX = torch.zeros((n_variants, 2 + k, 2 + k),
+    XtX = torch.empty((n_variants, 2 + k, 2 + k),
                       device=G_t.device, dtype=G_t.dtype)
-    XtX[:, 0, 0] = n_samples
-    XtX[:, 0, 1] = XtX[:, 1, 0] = sum_g
-    XtX[:, 1, 1] = sum_g2
-    XtX[:, 0, 2:] = XtX[:, 2:, 0] = sum_h
-    XtX[:, 1, 2:] = XtX[:, 2:, 1] = sum_gh
+    XtX[:, 0, 0]   = n_samples
+    XtX[:, 0, 1]   = XtX[:, 1, 0] = sum_g
+    XtX[:, 1, 1]   = sum_g2
+    XtX[:, 0, 2:]  = XtX[:, 2:, 0] = sum_h
+    XtX[:, 1, 2:]  = XtX[:, 2:, 1] = sum_gh
     XtX[:, 2:, 2:] = HtH
 
     # Assemble XtY
@@ -342,18 +342,19 @@ def calculate_corr_paired(
         inv_XtX = XtX_inv
     else:
         try:
-            beta = torch.linalg.solve(XtX, XtY).squeeze(-1)
-            inv_XtX = torch.linalg.inv(XtX)
+            L = torch.linalg.cholesky(XtX)
+            beta = torch.cholesky_solve(XtY, L).squeeze(-1) # solve for β
+            inv_XtX = torch.cholesky_inverse(L)             # (XtX)⁻¹ from same factorization
         except RuntimeError: # Fallback to pinv
             XtX_inv = torch.linalg.pinv(XtX)
             beta = (XtX_inv @ XtY).squeeze(-1)
-            
+
     # RSS
     if Y_t.shape[0] == 1:
-        rss = y.pow(2).sum() - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
+        rss = y.pow(2).sum() - (beta.unsqueeze(1) @ XtY).squeeze()
     else:
-        rss = Y_t.pow(2).sum(1) - torch.einsum("vi,vi->v", beta, XtY.squeeze(-1))
-        
+        rss = Y_t.pow(2).sum(1) - (beta.unsqueeze(1) @ XtY).squeeze()
+
     # Degrees of freedom
     p = 2 + k
     if dof_vector is not None:
