@@ -66,9 +66,6 @@ def calculate_corr_paired_batched(G_t, H_t, Y_t):
     n_pheno = Y_t.shape[0]
     _, _, k = H_t.shape
 
-    # Build X'X blockwise
-    ones = torch.ones((n_samples,), device=G_t.device, dtype=G_t.dtype)
-
     # Precompute haplotype-only constants
     sum_h = H_t.sum(1) # (n_variants, k)
     HtH   = H_t.transpose(1, 2) @ H_t
